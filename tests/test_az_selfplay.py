@@ -157,3 +157,51 @@ def test_history_length_is_configurable_end_to_end():
     net = az.Net(6, 6, frames=16, attn="pisa", block=8, topk=2)
     logits, value = net(torch.from_numpy(nxt[None]))
     assert logits.shape == (1, az.num_actions(6, 6)) and torch.isfinite(value).all()
+
+
+def _gdn_inputs(T=6, H=2, dk=8, dv=8, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    r = lambda *s: torch.randn(*s, generator=g)
+    q, k, v = r(1, T, H, dk), torch.nn.functional.normalize(r(1, T, H, dk), dim=-1), r(1, T, H, dv)
+    alpha, b, w = (torch.rand(1, T, H, d, generator=g) * 0.5 + 0.4 for d in (dk, dk, dv))
+    return q, k, v, alpha, b, w
+
+
+def test_gdn2_scan_matches_explicit_matrix_form():
+    q, k, v, alpha, b, w = _gdn_inputs()
+    got = az.gdn2_scan(q, k, v, alpha, b, w)
+    for h in range(2):  # S_t = (I - k (b*k)^T) D S_{t-1} + k (w*v)^T ; o_t = S_t^T q_t (eq. 10)
+        S = torch.zeros(8, 8)
+        for t in range(6):
+            kt = k[0, t, h]
+            S = (torch.eye(8) - torch.outer(kt, b[0, t, h] * kt)) @ (alpha[0, t, h, :, None] * S) \
+                + torch.outer(kt, w[0, t, h] * v[0, t, h])
+            assert torch.allclose(got[0, t, h], S.T @ q[0, t, h], atol=1e-5)
+
+
+def test_gdn2_overwrites_instead_of_accumulating_and_write_gate_is_selective():
+    k = torch.nn.functional.normalize(torch.randn(1, 2, 1, 8), dim=-1)
+    k = torch.cat([k[:, :1], k[:, :1]], 1)  # same key written twice
+    v = torch.stack([torch.ones(1, 1, 8), -torch.ones(1, 1, 8)], 1).reshape(1, 2, 1, 8)
+    ones = torch.ones(1, 2, 1, 8)
+    out = az.gdn2_scan(k, k, v, ones, ones, ones)  # query = key, no decay, full erase/write
+    assert torch.allclose(out[0, 1, 0], -torch.ones(8), atol=1e-5)  # latest value, not 1 + (-1)
+    w = ones.clone()
+    w[..., :4] = 0  # write gate off on the first four value channels
+    out = az.gdn2_scan(k, k, v, ones, ones, w)
+    assert torch.allclose(out[0, 1, 0, :4], torch.zeros(4), atol=1e-6)
+    assert torch.allclose(out[0, 1, 0, 4:], -torch.ones(4), atol=1e-5)
+
+
+def test_hybrid_net_remembers_oldest_frame_and_trains():
+    torch.manual_seed(3)
+    net = az.Net(6, 6, frames=16, attn="hybrid", block=8, topk=2).eval()
+    x = torch.randn(1, 16, az.CHANNELS, 6, 6)
+    logits, value = net(x)
+    y = x.clone()
+    y[:, 0, :, 0, 0] += 3  # oldest frame, cell (0, 0): reaches current-cell logits via the GDN state
+    assert not torch.allclose(net(y)[0][:, :8], logits[:, :8])
+    net.train()
+    out, v = net(x)
+    (out.sum() + v.sum()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())

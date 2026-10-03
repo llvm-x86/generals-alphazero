@@ -76,6 +76,22 @@ fused Triton GPU kernel, and replay storage grows linearly with `--frames`
 (16 frames at 30x30 is about 0.9 MB per sample). Dense and PISA checkpoints, and
 checkpoints with different `--frames`, are not interchangeable.
 
+`--attn hybrid` interleaves [Gated DeltaNet-2](https://arxiv.org/abs/2605.22791)
+layers with PISA layers (GDN-2, PISA, GDN-2, PISA). GDN-2 runs causally over the
+frame axis independently for every cell, with a fixed-size delta-rule state
+(channel-wise decay plus separate erase and write gates, eq. 9 of the paper), so
+the last frame's cell token summarises the whole history. PISA mixes across
+space and recent frames. Tests check the scan against the explicit matrix form
+of the paper's update, that repeated writes to one key overwrite rather than
+accumulate, that the write gate is channel-selective, and that the oldest frame
+reaches the current cell's logits. On the 30x30, 16-frame benchmark above the
+hybrid took 4.61s, but it has only two attention layers against four in the
+dense/PISA rows, so that is not a like-for-like speed comparison, and nothing
+here shows it plays better. Simplifications versus the paper: no short
+convolution or output gate, and a plain PyTorch loop over frames instead of the
+chunkwise Triton kernels. The state is rebuilt from the frame window on every
+call; carrying it across turns for constant-cost search steps is not implemented.
+
 Earlier one-off checkpoints lack optimizer/RNG state and use a different input
 shape; start a fresh run rather than using `--resume` on them.
 

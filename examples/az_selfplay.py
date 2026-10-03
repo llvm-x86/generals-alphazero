@@ -203,6 +203,59 @@ class PisaLayer(nn.Module):
         return A
 
 
+def gdn2_scan(q, k, v, alpha, b, w):
+    """Gated Delta Rule-2 (arXiv 2605.22791 eq. 9), sequential over time.
+
+    q, k: (B, T, H, dk) (k unit-norm); v: (B, T, H, dv); alpha, b: (B, T, H, dk) in (0, 1];
+    w: (B, T, H, dv). State S: (B, H, dk, dv):
+        S_bar = diag(alpha) S;  r = S_bar^T (b * k);  S = S_bar + k (w * v - r)^T;  o = S^T q.
+    Equal b/w scalars recover KDA; plus scalar alpha recovers Gated DeltaNet."""
+    B, T, H, dk = q.shape
+    S = q.new_zeros(B, H, dk, v.shape[-1])
+    out = []
+    for t in range(T):
+        S = alpha[:, t, :, :, None] * S
+        r = torch.einsum("bhkv,bhk->bhv", S, b[:, t] * k[:, t])
+        S = S + torch.einsum("bhk,bhv->bhkv", k[:, t], w[:, t] * v[:, t] - r)
+        out.append(torch.einsum("bhkv,bhk->bhv", S, q[:, t]))
+    return torch.stack(out, 1)
+
+
+class GdnLayer(nn.Module):
+    """Gated DeltaNet-2 over the frame axis, independently for every cell.
+
+    Causal in time, so the last frame's cell token summarises the whole history
+    in a fixed-size state. The global token is left to the attention layers.
+    Simplifications vs the paper: no short convolution or output gate, and a
+    plain PyTorch time loop instead of the chunkwise WY Triton kernels."""
+
+    def __init__(self, width, heads, frames, cells):
+        super().__init__()
+        self.h, self.frames, self.cells = heads, frames, cells
+        d = width // heads
+        self.n1, self.n2 = nn.LayerNorm(width), nn.LayerNorm(width)
+        self.qkv = nn.Linear(width, 3 * width)
+        self.alpha, self.erase, self.write = nn.Linear(width, width), nn.Linear(width, width), nn.Linear(width, width)
+        self.log_a = nn.Parameter(torch.zeros(heads, d))  # decay rate scale: g = -exp(a) * softplus(W x + delta)
+        self.delta = nn.Parameter(torch.zeros(heads, d))
+        self.onorm, self.proj = nn.LayerNorm(width), nn.Linear(width, width)
+        self.mlp = nn.Sequential(nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width))
+
+    def forward(self, x):  # (B, 1 + frames*cells, width); token 0 is the global token
+        B, _, width = x.shape
+        T, N, H = self.frames, self.cells, self.h
+        c = self.n1(x[:, 1:]).reshape(B, T, N, width).transpose(1, 2).reshape(B * N, T, width)
+        q, k, v = (t.reshape(B * N, T, H, -1) for t in self.qkv(c).chunk(3, -1))
+        q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+        g = -self.log_a.exp() * F.softplus(self.alpha(c).reshape(B * N, T, H, -1) + self.delta)
+        b = torch.sigmoid(self.erase(c)).reshape(B * N, T, H, -1)
+        w = torch.sigmoid(self.write(c)).reshape(B * N, T, H, -1)
+        o = gdn2_scan(q, k, v, g.exp(), b, w).reshape(B * N, T, width)
+        o = self.proj(self.onorm(o)).reshape(B, N, T, width).transpose(1, 2).reshape(B, T * N, width)
+        x = torch.cat([x[:, :1], x[:, 1:] + o], 1)
+        return x + self.mlp(self.n2(x))
+
+
 class Net(nn.Module):
     """Pixel-level spacetime transformer: one token per cell per frame, no pooling.
 
@@ -219,6 +272,9 @@ class Net(nn.Module):
         self.glob = nn.Parameter(torch.zeros(1, 1, width))
         if attn == "pisa":
             self.body = nn.Sequential(*[PisaLayer(width, heads, block, topk) for _ in range(layers)])
+        elif attn == "hybrid":  # GDN-2 (per-cell memory over frames) interleaved with PISA (space)
+            self.body = nn.Sequential(*[GdnLayer(width, heads, frames, h * w) if i % 2 == 0
+                                        else PisaLayer(width, heads, block, topk) for i in range(layers)])
         else:
             layer = nn.TransformerEncoderLayer(width, heads, 4 * width, dropout=0.0, batch_first=True, norm_first=True)
             self.body = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
@@ -386,8 +442,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--games", type=int, default=8)
     ap.add_argument("--sims", type=int, default=32)
-    ap.add_argument("--attn", choices=("dense", "pisa"), default="dense",
-                    help="pisa = pyramid block-sparse attention; only pays off on large boards")
+    ap.add_argument("--attn", choices=("dense", "pisa", "hybrid"), default="dense",
+                    help="pisa = pyramid block-sparse attention; hybrid = GDN-2 over time + PISA over space")
     ap.add_argument("--frames", type=int, default=FRAMES, help="observation history length; long histories want --attn pisa")
     ap.add_argument("--size", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=400)
