@@ -75,6 +75,12 @@ leave ever-seen cells out of the hidden-land support (default off). Held-out che
 uniform over the plausible cells (5.05x) on 8,433 held-out rows. In a 112-game side-swapped A/B vs Expander
 (6x6, untrained net, 8 sims) `--belief` on and off gave identical results, so search impact is unmeasured.
 
+Behaviour-cloning warm start (`examples/bc_warmstart.py`): clones Expander (half the games with 15% random-move noise,
+clean label) from both seats' histories, split by game, then `az_selfplay.py --resume` fine-tunes from the checkpoint
+(pass the same `--size/--sims/--max-steps/--seed`). Measured on 6x6, 150 steps, 150 games (29k train samples, 10 epochs):
+held-out teacher-action accuracy 0.317 (Expander samples its move, so accuracy is capped); policy-argmax vs Random,
+100 games: 14 W / 13 L / 73 D (Expander itself: 74/2/24) -- the 90% bar was NOT met.
+
 Expander does not hunt the general: on 8x8 at `--max-steps 200` roughly 44% of its games vs Random
 are truncated draws, so use a longer limit when you want real captures.
 
