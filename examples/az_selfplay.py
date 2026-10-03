@@ -80,6 +80,26 @@ def legal_mask(obs, h, w):
     return np.concatenate([moves.reshape(-1), [True]])
 
 
+def make_env(size, max_steps):
+    """Env with ~10 castles where the board allows (area // 6 on tiny boards) and a size-scaled
+    minimum general distance. The generator carves castles out of mountains and caps all mountains
+    at area // 4, so we ask for castles + the default 18% real terrain and let that cap bind.
+    Generals stay connected over open ground (checked in tests)."""
+    castles = min(10, size * size // 6)
+    lo = 0.18 + castles / size**2
+    return GeneralsEnv(grid_dims=(size, size), truncation=max_steps, general_trade=True,
+                       min_generals_distance=max(3, size // 2), num_castles_range=(castles, castles),
+                       mountain_density_range=(lo, lo + 0.08))
+
+
+# Fraction of fogged structures that are castles; measured on make_env boards (see README); checked by tests/test_az_selfplay.py.
+CASTLE_FRACTION = {6: 0.65, 8: 0.63}
+
+
+def castle_fraction(size):
+    return CASTLE_FRACTION[min(CASTLE_FRACTION, key=lambda k: abs(k - size))]
+
+
 def determinize(state, me, rng):
     """Sample a board from one player's observation, never from hidden tiles."""
     obs = get_observation(state, me)
@@ -87,7 +107,8 @@ def determinize(state, me, rng):
     armies = np.asarray(obs.armies).copy()
     own = np.asarray(obs.owned_cells).copy()
     enemy = np.asarray(obs.opponent_cells).copy()
-    hidden = np.flatnonzero(fog)
+    # Fogged structures are almost never enemy-owned castles, so enemy land goes on plain hidden tiles first.
+    hidden = np.flatnonzero(fog & ~np.asarray(obs.structures_in_fog))
     unseen_land = max(0, int(obs.opponent_land_count) - int(enemy.sum()))
     # ponytail: uniform hidden-land prior; use a learned belief model once replay data justifies it.
     chosen = rng.choice(hidden, size=min(unseen_land, len(hidden)), replace=False)
@@ -95,7 +116,7 @@ def determinize(state, me, rng):
     mountains = np.asarray(obs.mountains).copy()
     castles = np.asarray(obs.castles).copy()
     structures = np.asarray(obs.structures_in_fog).copy()
-    hidden_castles = (rng.random(structures.shape) < 0.2) & structures
+    hidden_castles = (rng.random(structures.shape) < castle_fraction(structures.shape[0])) & structures
     hidden_castles |= structures & enemy
     castles |= hidden_castles
     mountains |= structures & ~hidden_castles
@@ -458,7 +479,7 @@ def main(argv=None):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     h = w = args.size
-    env = GeneralsEnv(grid_dims=(h, w), truncation=args.max_steps, general_trade=True)
+    env = make_env(h, args.max_steps)
     net = Net(h, w, frames=args.frames, attn=args.attn)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)

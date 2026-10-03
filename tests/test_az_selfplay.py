@@ -221,3 +221,46 @@ def test_gdn2_scan_matches_symbolic_closed_form():
     for t in range(T):
         want = w * sum(lam ** (t - s) * v[s] for s in range(t + 1))
         assert torch.allclose(got[t], want, atol=1e-5)
+
+
+def _fog_states(size, n, steps=60):
+    from generals import get_observation
+    from generals.agents import ExpanderAgent
+    env, agent, key, out = az.make_env(size, steps), ExpanderAgent(), jr.PRNGKey(0), []
+    while len(out) < n:
+        key, k = jr.split(key)
+        state = env.init_state(k)
+        while int(state.time) < steps and int(state.winner) < 0:
+            obs = [get_observation(state, p) for p in (0, 1)]
+            if int(state.time) >= 4 and int(state.time) % 4 == 0:
+                out += [(state, 0), (state, 1)]
+            key, a, b = jr.split(key, 3)
+            state, _ = game.step(state, jnp.stack([agent.act(obs[0], a), agent.act(obs[1], b)]), general_trade=True)
+    return out[:n]
+
+
+@pytest.mark.parametrize("size", [6, 8])
+def test_make_env_boards(size):
+    from generals.core.grid import bfs_distance_field
+    env = az.make_env(size, 50)
+    for i in range(10):
+        s = env.init_state(jr.PRNGKey(i))
+        assert int(np.asarray(s.castles).sum()) == min(10, size * size // 6)
+        g = np.asarray(s.general_positions)
+        d = int(bfs_distance_field(s.passable, tuple(g[0]))[tuple(g[1])])
+        assert max(3, size // 2) <= d < size * size  # far enough apart and connected
+
+
+@pytest.mark.parametrize("size", [6, 8])
+def test_determinized_castle_fraction_matches_real(size):
+    from generals import get_observation
+    rng = np.random.default_rng(1)
+    real = det = total = 0
+    for state, me in _fog_states(size, 200):
+        m = np.asarray(get_observation(state, me).structures_in_fog)
+        d = az.determinize(state, me, rng)
+        real += int((np.asarray(state.castles) & m).sum())
+        det += int((np.asarray(d.castles) & m).sum())
+        total += int(m.sum())
+    assert total > 0
+    assert abs(real - det) / total < 0.05

@@ -48,6 +48,22 @@ PYTHONPATH=. python examples/az_selfplay.py --games 1 --sims 2 --size 4 --max-st
 PYTHONPATH=. python examples/az_selfplay.py --games 2 --sims 2 --size 4 --max-steps 12 --output checkpoint.pt --resume
 ```
 
+Training boards come from `make_env(size, max_steps)`: about 10 castles where the board
+allows (`size*size//6` on tiny boards), `min_generals_distance = max(3, size//2)`. Search's hidden
+castle prior (`CASTLE_FRACTION`: 0.65 for 6x6, 0.63 for 8x8) was measured as true castles over
+`structures_in_fog` cells in ~400 Expander-vs-Expander states per size on those boards.
+
+Evaluate against built-in agents (random, expander, hunter, harvester) or a checkpoint
+(`ckpt:<path>`, policy argmax, or `--sims N` for search), side-swapped, with Wilson 95% intervals.
+Truncated games are draws; a second table adjudicates them by the score proxy (not real wins):
+
+```bash
+PYTHONPATH=. python examples/eval_agents.py expander random --size 8 --games 200 --max-steps 500
+```
+
+Expander does not hunt the general: on 8x8 at `--max-steps 200` roughly 44% of its games vs Random
+are truncated draws, so use a longer limit when you want real captures.
+
 Real wins/losses train the value head with +1/-1. Games cut off at
 `--max-steps` use a bounded army/land **score proxy**, not a falsely labeled
 draw. The net sees 4 frames of memory, but the belief sampler still forgets previously
