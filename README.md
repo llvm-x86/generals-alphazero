@@ -35,8 +35,9 @@ pip install -e '.[alphazero]'
 
 ## AlphaZero-style research baseline
 
-`examples/az_selfplay.py` trains a convolutional policy/value network on PUCT
-visits and self-play. Search samples hidden terrain, enemy territory/armies and
+`examples/az_selfplay.py` trains a pixel-level spacetime transformer (one token per cell per frame
+over the last 4 own observations, a global token for value, no pooling or
+convolution) on PUCT visits and self-play. Search samples hidden terrain, enemy territory/armies and
 general position **from each player's observation and public totals**, rather
 than expanding the true hidden board. Opponent replies are resampled on each
 search visit. Start with a small smoke run:
@@ -49,8 +50,8 @@ PYTHONPATH=. python examples/az_selfplay.py --games 2 --sims 2 --size 4 --max-st
 
 Real wins/losses train the value head with +1/-1. Games cut off at
 `--max-steps` use a bounded army/land **score proxy**, not a falsely labeled
-draw. The simple belief prior forgets previously sighted terrain and samples
-only four candidate boards per search; it is not an information-set solver.
+draw. The net sees 4 frames of memory, but the belief sampler still forgets previously
+sighted terrain and samples only four candidate boards per search; it is not an information-set solver.
 Training on 4×4 smoke boards does not produce a ranked-ready model. Evaluate
 on held-out maps and strong opponents before any live use. Checkpoints are
 saved atomically after each game; load only checkpoints you trust.

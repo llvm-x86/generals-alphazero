@@ -5,7 +5,8 @@ AlphaZero-style self-play baseline for the JAX Generals.io simulator.
 
 What it is
   * The network sees only the player's fog-limited observation, including
-    public army/land totals. A convolutional policy/value model is trained
+    public army/land totals. A pixel-level spacetime transformer (a token per cell
+    per frame over the last 4 own observations, no pooling) is trained
     from PUCT visits and final game outcomes.
   * Search samples hidden boards consistent with the player's observation
     and public totals. Four independent root samples reduce dependence on a
@@ -36,6 +37,14 @@ from generals.core.game import step as game_step
 
 C_PUCT = 1.5
 CHANNELS = 15
+FRAMES = 4  # past own-observation frames the net attends over (fog memory)
+
+
+def stack_with(prev, frame):
+    """Append a frame to a (FRAMES, C, H, W) history; first call repeats the frame."""
+    if prev is None:
+        return np.repeat(frame[None], FRAMES, 0)
+    return np.concatenate([prev[1:], frame[None]])
 
 
 def num_actions(h, w):
@@ -120,28 +129,40 @@ def determinize(state, me, rng):
 
 
 class Net(nn.Module):
-    def __init__(self, h, w, width=48):
+    """Pixel-level spacetime transformer: one token per cell per frame, no pooling.
+
+    Input (B, FRAMES, C, H, W) is the player's own recent fog observations, so
+    attention can recall earlier sightings. A learned global token feeds the
+    value and pass heads; the policy comes from each current-frame cell token."""
+
+    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES):
         super().__init__()
-        self.inp = nn.Conv2d(CHANNELS, width, 3, padding=1)
-        self.body = nn.ModuleList([nn.Conv2d(width, width, 3, padding=d, dilation=d) for d in (1, 2, 4)])
-        self.pol = nn.Conv2d(width, 8, 1)  # per cell: 4 dirs x 2 splits
+        self.cells = h * w
+        self.inp = nn.Linear(CHANNELS, width)
+        self.pos = nn.Parameter(torch.randn(1, 1, h * w, width) * 0.02)
+        self.tpos = nn.Parameter(torch.randn(1, frames, 1, width) * 0.02)
+        self.glob = nn.Parameter(torch.zeros(1, 1, width))
+        layer = nn.TransformerEncoderLayer(width, heads, 4 * width, dropout=0.0, batch_first=True, norm_first=True)
+        self.body = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(width)
+        self.pol = nn.Linear(width, 8)  # per cell: 4 dirs x 2 splits
         self.pass_logit = nn.Linear(width, 1)
         self.val = nn.Sequential(nn.Linear(width, 32), nn.ReLU(), nn.Linear(32, 1), nn.Tanh())
 
     def forward(self, x):
-        x = F.relu(self.inp(x))
-        for c in self.body:
-            x = F.relu(x + c(x))
-        logits = self.pol(x).permute(0, 2, 3, 1).reshape(x.shape[0], -1)  # (B, H*W*8), cell-major
-        g = x.mean((2, 3))
+        b, t = x.shape[:2]
+        tok = self.inp(x.flatten(3).transpose(2, 3)) + self.pos + self.tpos  # (B, T, H*W, width)
+        tok = tok.reshape(b, t * self.cells, -1)
+        tok = self.norm(self.body(torch.cat([self.glob.expand(b, -1, -1), tok], 1)))
+        g, cur = tok[:, 0], tok[:, -self.cells:]  # last frame's cells
+        logits = self.pol(cur).reshape(b, -1)  # (B, H*W*8), cell-major
         return torch.cat([logits, self.pass_logit(g)], 1), self.val(g).squeeze(1)
 
 
 @torch.no_grad()
-def evaluate(net, obs_list, masks):
-    """Batch of fog observations -> masked priors (B, A) and values (B,)."""
-    x = torch.from_numpy(np.stack([features(o) for o in obs_list]))
-    logits, v = net(x)
+def evaluate(net, stacks, masks):
+    """Batch of observation histories -> masked priors (B, A) and values (B,)."""
+    logits, v = net(torch.from_numpy(np.stack(stacks)))
     logits = logits.masked_fill(~torch.from_numpy(np.stack(masks)), -1e9)
     return F.softmax(logits, 1).numpy(), v.numpy()
 
@@ -149,8 +170,9 @@ def evaluate(net, obs_list, masks):
 class Node:
     """Search node for player `me`. Stores priors for both players (one batched eval)."""
 
-    def __init__(self, state, prior, opp_prior, value):
+    def __init__(self, state, prior, opp_prior, value, stack=None, opp_stack=None):
         self.state, self.prior, self.opp_prior, self.value = state, prior, opp_prior, value
+        self.stack, self.opp_stack = stack, opp_stack  # observation histories incl. this node's frame
         self.n = np.zeros_like(prior)
         self.w = np.zeros_like(prior)
         self.children = {}  # (own action, sampled opponent action) -> child/terminal value
@@ -174,17 +196,19 @@ class Searcher:
     def __init__(self, net, h, w, max_steps, rng):
         self.net, self.h, self.w, self.max_steps, self.rng = net, h, w, max_steps, rng
 
-    def make_node(self, state, me):
+    def make_node(self, state, me, prev=None, opp_prev=None):
         obs = [get_observation(state, me), get_observation(state, 1 - me)]
         masks = [legal_mask(o, self.h, self.w) for o in obs]
-        p, v = evaluate(self.net, obs, masks)
-        return Node(state, p[0], p[1], float(v[0]))
+        # ponytail: the opponent's true history is unknown to us; it starts as a repeat of its current frame.
+        stacks = [stack_with(prev, features(obs[0])), stack_with(opp_prev, features(obs[1]))]
+        p, v = evaluate(self.net, stacks, masks)
+        return Node(state, p[0], p[1], float(v[0]), *stacks)
 
-    def search(self, state, me, sims, noise=True):
+    def search(self, state, me, sims, prev=None, noise=True):
         counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
         roots = min(4, sims)
         for i in range(roots):
-            root = self.make_node(determinize(state, me, self.rng), me)
+            root = self.make_node(determinize(state, me, self.rng), me, prev)
             if noise:
                 legal = np.flatnonzero(root.prior > 0)
                 root.prior = root.prior.copy()
@@ -226,7 +250,7 @@ class Searcher:
         if term is not None:
             node.children[edge] = (None, term)
             return term
-        child = self.make_node(state, me)
+        child = self.make_node(state, me, node.stack, node.opp_stack)
         node.children[edge] = (child, None)
         return child.value
 
@@ -235,7 +259,7 @@ def self_play(net, h, w, sims, max_steps, key, rng, env):
     """One game; returns list of (features, pi, mask, z) for both players, and result string."""
     state = env.init_state(key)
     searcher = Searcher(net, h, w, max_steps, rng)
-    rec = [[], []]
+    rec, hist = [[], []], [None, None]
     while True:
         res = outcome(state, 0, max_steps)
         if res is not None:
@@ -243,13 +267,14 @@ def self_play(net, h, w, sims, max_steps, key, rng, env):
         acts = [None, None]
         for me in (0, 1):
             obs = get_observation(state, me)
-            counts = searcher.search(state, me, sims)
+            counts = searcher.search(state, me, sims, hist[me])
+            hist[me] = stack_with(hist[me], features(obs))
             pi = counts / counts.sum()
             temp = 1.0 if int(state.time) < 10 else 0.25
             p = pi ** (1 / temp)
             a = int(rng.choice(len(p), p=p / p.sum()))
             acts[me] = decode(a, h, w)
-            rec[me].append((features(obs), pi.astype(np.float32), legal_mask(obs, h, w)))
+            rec[me].append((hist[me], pi.astype(np.float32), legal_mask(obs, h, w)))
         state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
     samples = []
     for me in (0, 1):

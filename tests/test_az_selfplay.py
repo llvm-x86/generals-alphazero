@@ -95,3 +95,17 @@ def test_resume_matches_uninterrupted_training(tmp_path):
     assert a["completed"] == b["completed"] == 2
     assert len(a["replay"]) == len(b["replay"]) == 16
     assert all(torch.equal(a["model"][k], b["model"][k]) for k in a["model"])
+
+def test_net_is_spacetime_transformer_with_memory():
+    h = w = 6
+    net = az.Net(h, w).eval()
+    assert not any(isinstance(m, (torch.nn.Conv2d, torch.nn.MaxPool2d, torch.nn.AvgPool2d,
+                                  torch.nn.AdaptiveAvgPool2d)) for m in net.modules())
+    x = torch.randn(2, az.FRAMES, az.CHANNELS, h, w)
+    logits, value = net(x)
+    assert logits.shape == (2, az.num_actions(h, w)) and value.shape == (2,)
+    y = x.clone()
+    y[:, 0, :, 5, 5] += 3  # change only the OLDEST frame, far from cell (0, 0)
+    out = net(y)
+    assert not torch.allclose(out[0][:, :8], logits[:, :8])  # past frames reach current-cell logits
+    assert not torch.allclose(out[1], value)
