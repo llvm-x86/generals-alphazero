@@ -216,12 +216,25 @@ class PisaLayer(nn.Module):
         x = x + self.proj(torch.cat([out_g, out_c], 2).transpose(1, 2).reshape(b, n, width))
         return x + self.mlp(self.n2(x))
 
+    def step(self, x, cache, keep):
+        """Streaming forward for the newest frame (x: (B, 1 + N, width)). `cache` = (k, v) of the
+        cell tokens of earlier frames as computed at their own time, or None; only the newest
+        frame's tokens are queries. Returns (out, cache trimmed to the last `keep` cell tokens)."""
+        b, n, width = x.shape
+        q, k, v = self.qkv(self.n1(x)).reshape(b, n, 3, self.h, width // self.h).permute(2, 0, 3, 1, 4)
+        kc, vc = (k[:, :, 1:], v[:, :, 1:]) if cache is None else (torch.cat([cache[0], k[:, :, 1:]], 2),
+                                                                  torch.cat([cache[1], v[:, :, 1:]], 2))
+        out_g = F.scaled_dot_product_attention(q[:, :, :1], torch.cat([k[:, :, :1], kc], 2), torch.cat([v[:, :, :1], vc], 2))
+        out_c = self.sparse(q[:, :, 1:], kc, vc, k[:, :, :1], v[:, :, :1])
+        x = x + self.proj(torch.cat([out_g, out_c], 2).transpose(1, 2).reshape(b, n, width))
+        return x + self.mlp(self.n2(x)), (kc[:, :, kc.shape[2] - keep:], vc[:, :, vc.shape[2] - keep:])
+
     def sparse(self, q, k, v, kg, vg):
         B, H, N, d = q.shape
         C = self.block
-        P = 1 << (-(-N // C) - 1).bit_length()  # leaf blocks padded to a power of two
-        pad = P * C - N
-        valid = F.pad(torch.ones(N, dtype=torch.bool), (0, pad))
+        P = 1 << (-(-k.shape[2] // C) - 1).bit_length()  # leaf blocks padded to a power of two
+        pad = P * C - k.shape[2]
+        valid = F.pad(torch.ones(k.shape[2], dtype=torch.bool), (0, pad))
         k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
         with torch.no_grad():
             sel = self.select(q * d ** -0.5, k, valid, P)  # (B, N, S) leaf-block ids
@@ -264,6 +277,14 @@ class PisaLayer(nn.Module):
         return A
 
 
+def gdn2_step(S, q, k, v, alpha, b, w):
+    """One time step of the GDN-2 recurrence; q, k, alpha, b: (B, H, dk), v, w: (B, H, dv), S: (B, H, dk, dv)."""
+    S = alpha[..., None] * S
+    r = torch.einsum("bhkv,bhk->bhv", S, b * k)
+    S = S + torch.einsum("bhk,bhv->bhkv", k, w * v - r)
+    return S, torch.einsum("bhkv,bhk->bhv", S, q)
+
+
 def gdn2_scan(q, k, v, alpha, b, w):
     """Gated Delta Rule-2 (arXiv 2605.22791 eq. 9), sequential over time.
 
@@ -275,10 +296,8 @@ def gdn2_scan(q, k, v, alpha, b, w):
     S = q.new_zeros(B, H, dk, v.shape[-1])
     out = []
     for t in range(T):
-        S = alpha[:, t, :, :, None] * S
-        r = torch.einsum("bhkv,bhk->bhv", S, b[:, t] * k[:, t])
-        S = S + torch.einsum("bhk,bhv->bhkv", k[:, t], w[:, t] * v[:, t] - r)
-        out.append(torch.einsum("bhkv,bhk->bhv", S, q[:, t]))
+        S, o = gdn2_step(S, q[:, t], k[:, t], v[:, t], alpha[:, t], b[:, t], w[:, t])
+        out.append(o)
     return torch.stack(out, 1)
 
 
@@ -316,6 +335,21 @@ class GdnLayer(nn.Module):
         x = torch.cat([x[:, :1], x[:, 1:] + o], 1)
         return x + self.mlp(self.n2(x))
 
+    def step(self, x, state):
+        """Advance one frame (x: (B, 1 + N, width)) from the per-cell state `(S,)` (None = zeros)."""
+        B, _, width = x.shape
+        N, H = self.cells, self.h
+        c = self.n1(x[:, 1:]).reshape(B * N, width)
+        q, k, v = (t.reshape(B * N, H, -1) for t in self.qkv(c).chunk(3, -1))
+        q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+        g = -self.log_a.exp() * F.softplus(self.alpha(c).reshape(B * N, H, -1) + self.delta)
+        b = torch.sigmoid(self.erase(c)).reshape(B * N, H, -1)
+        w = torch.sigmoid(self.write(c)).reshape(B * N, H, -1)
+        S = q.new_zeros(B * N, H, k.shape[-1], v.shape[-1]) if state is None else state[0]
+        S, o = gdn2_step(S, q, k, v, g.exp(), b, w)
+        x = torch.cat([x[:, :1], x[:, 1:] + self.proj(self.onorm(o.reshape(B * N, width))).reshape(B, N, width)], 1)
+        return x + self.mlp(self.n2(x)), (S,)
+
 
 class Net(nn.Module):
     """Pixel-level spacetime transformer: one token per cell per frame, no pooling.
@@ -324,9 +358,11 @@ class Net(nn.Module):
     attention can recall earlier sightings. A learned global token feeds the
     value and pass heads; the policy comes from each current-frame cell token."""
 
-    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4):
+    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4, stream=False):
         super().__init__()
-        self.cells, self.frames = h * w, frames
+        self.cells, self.frames, self.stream = h * w, frames, stream
+        if stream and attn != "hybrid":
+            raise ValueError("stream (incremental) mode needs attn='hybrid'")
         self.inp = nn.Linear(CHANNELS, width)
         self.pos = nn.Parameter(torch.randn(1, 1, h * w, width) * 0.02)
         self.tpos = nn.Parameter(torch.randn(1, frames, 1, width) * 0.02)
@@ -346,34 +382,71 @@ class Net(nn.Module):
         self.val = nn.Sequential(nn.Linear(width, 32), nn.ReLU(), nn.Linear(32, 1), nn.Tanh())
 
     def forward(self, x, with_belief=False):
-        """(policy logits, value), plus masked (B, H*W) belief logits when with_belief."""
+        """(policy logits, value), plus masked (B, H*W) belief logits when with_belief.
+
+        stream=True: the window is folded frame by frame from an empty state (== `step` applied to
+        every frame), which is the same function the incremental path carries across turns."""
+        if self.stream:
+            state = None
+            for t in range(x.shape[1] - 1):
+                state = self._trunk(x[:, t], state)[2]
+            return self.step(x[:, -1], state, with_belief)[0]
         b, t = x.shape[:2]
         tok = self.inp(x.flatten(3).transpose(2, 3)) + self.pos + self.tpos  # (B, T, H*W, width)
         tok = tok.reshape(b, t * self.cells, -1)
         tok = self.norm(self.body(torch.cat([self.glob.expand(b, -1, -1), tok], 1)))
-        g, cur = tok[:, 0], tok[:, -self.cells:]  # last frame's cells
-        logits = self.pol(cur).reshape(b, -1)  # (B, H*W*8), cell-major
+        return self._heads(tok[:, 0], tok[:, -self.cells:], x[:, -1], with_belief)
+
+    def _heads(self, g, cur, frame, with_belief):
+        logits = self.pol(cur).reshape(len(g), -1)  # (B, H*W*8), cell-major
         out = torch.cat([logits, self.pass_logit(g)], 1), self.val(g).squeeze(1)
         if not with_belief:
             return out
-        bel = self.bel(cur).squeeze(2).masked_fill(~belief_support(x[:, -1]), -1e9)
+        bel = self.bel(cur).squeeze(2).masked_fill(~belief_support(frame), -1e9)
         return out + (bel,)
+
+    def _trunk(self, frame, state):
+        """One frame (B, C, H, W) + per-layer state list (None = empty) -> (global tok, cell toks, new state).
+        GDN layers carry S (O(1) in history); PISA layers carry the last frames-1 frames' cell keys/values.
+        All frames share one temporal embedding (the window slot of a cached key is not recomputable)."""
+        b = frame.shape[0]
+        tok = self.inp(frame.flatten(2).transpose(1, 2)) + self.pos[0] + self.tpos[0, -1]
+        x = torch.cat([self.glob.expand(b, -1, -1), tok], 1)
+        new = []
+        for i, layer in enumerate(self.body):
+            s = None if state is None else state[i]
+            if isinstance(layer, GdnLayer):
+                x, s = layer.step(x, s)
+            else:
+                x, s = layer.step(x, s, (self.frames - 1) * self.cells)
+            new.append(s)
+        x = self.norm(x)
+        return x[:, 0], x[:, 1:], new
+
+    def step(self, frame, state, with_belief=False):
+        """Incremental inference for one new frame: (outputs as in forward, new state)."""
+        g, cur, state = self._trunk(frame, state)
+        return self._heads(g, cur, frame, with_belief), state
+
+
+def priors(logits, v, masks):
+    logits = logits.masked_fill(~torch.from_numpy(np.stack(masks)), -1e9)
+    return F.softmax(logits, 1).numpy(), v.numpy()
 
 
 @torch.no_grad()
 def evaluate(net, stacks, masks):
     """Batch of observation histories -> masked priors (B, A) and values (B,)."""
-    logits, v = net(torch.from_numpy(np.stack(stacks)))
-    logits = logits.masked_fill(~torch.from_numpy(np.stack(masks)), -1e9)
-    return F.softmax(logits, 1).numpy(), v.numpy()
+    return priors(*net(torch.from_numpy(np.stack(stacks))), masks)
 
 
 class Node:
     """Search node for player `me`. Stores priors for both players (one batched eval)."""
 
-    def __init__(self, state, prior, opp_prior, value, stack=None, opp_stack=None):
+    def __init__(self, state, prior, opp_prior, value, stack=None, opp_stack=None, st=None):
         self.state, self.prior, self.opp_prior, self.value = state, prior, opp_prior, value
         self.stack, self.opp_stack = stack, opp_stack  # observation histories incl. this node's frame
+        self.st = st  # incremental mode: batch-2 (me, opponent) recurrent net state after this node's frame
         self.n = np.zeros_like(prior)
         self.w = np.zeros_like(prior)
         self.children = {}  # (own action, sampled opponent action) -> child/terminal value
@@ -394,29 +467,47 @@ def outcome(state, me, max_steps):
 
 
 class Searcher:
-    def __init__(self, net, h, w, max_steps, rng, belief=False):
+    def __init__(self, net, h, w, max_steps, rng, belief=False, incremental=False):
         self.net, self.h, self.w, self.max_steps, self.rng, self.belief = net, h, w, max_steps, rng, belief
+        self.incremental = incremental  # carry GDN/PISA state in nodes: a child costs one net step
+        if incremental and not net.stream:
+            raise ValueError("incremental search needs Net(stream=True)")
 
-    def make_node(self, state, me, prev=None, opp_prev=None):
+    def make_node(self, state, me, prev=None, opp_prev=None, st=None):
+        """`st`: root -> my batch-1 net state (opponent's starts empty); child -> parent's batch-2 state."""
         obs = [get_observation(state, me), get_observation(state, 1 - me)]
         masks = [legal_mask(o, self.h, self.w) for o in obs]
         # ponytail: the opponent's true history is unknown to us; it starts as a repeat of its current frame.
         n = self.net.frames
         stacks = [stack_with(prev, features(obs[0], prev), n), stack_with(opp_prev, features(obs[1], opp_prev), n)]
-        p, v = evaluate(self.net, stacks, masks)
-        return Node(state, p[0], p[1], float(v[0]), *stacks)
+        if not self.incremental:
+            p, v = evaluate(self.net, stacks, masks)
+            return Node(state, p[0], p[1], float(v[0]), *stacks)
+        fr = torch.from_numpy(np.stack([s[-1] for s in stacks]))
+        with torch.no_grad():
+            if opp_prev is None:  # root: two independent batch-1 steps, then batch
+                (l0, v0), s0 = self.net.step(fr[:1], st)
+                (l1, v1), s1 = self.net.step(fr[1:], None)
+                (logits, v), st = (torch.cat([l0, l1]), torch.cat([v0, v1])), [tuple(torch.cat(t) for t in zip(a, b)) for a, b in zip(s0, s1)]
+            else:
+                (logits, v), st = self.net.step(fr, st)
+        p, v = priors(logits, v, masks)
+        return Node(state, p[0], p[1], float(v[0]), *stacks, st)
 
-    def search(self, state, me, sims, prev=None, noise=True):
+    def search(self, state, me, sims, prev=None, noise=True, prev_st=None):
         counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
         roots = min(4, sims)
         bel = seen = None
         if self.belief:  # own fog view + memory only
             stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
             with torch.no_grad():
-                logits = self.net(torch.from_numpy(stack[None]), True)[2][0]
+                if self.incremental:
+                    logits = self.net.step(torch.from_numpy(stack[-1:]), prev_st, True)[0][2][0]
+                else:
+                    logits = self.net(torch.from_numpy(stack[None]), True)[2][0]
             bel, seen = F.softmax(logits, 0).numpy(), stack[-1, 15] > 0.5
         for i in range(roots):
-            root = self.make_node(determinize(state, me, self.rng, bel, seen), me, prev)
+            root = self.make_node(determinize(state, me, self.rng, bel, seen), me, prev, None, prev_st)
             if noise:
                 legal = np.flatnonzero(root.prior > 0)
                 root.prior = root.prior.copy()
@@ -458,16 +549,16 @@ class Searcher:
         if term is not None:
             node.children[edge] = (None, term)
             return term
-        child = self.make_node(state, me, node.stack, node.opp_stack)
+        child = self.make_node(state, me, node.stack, node.opp_stack, node.st)
         node.children[edge] = (child, None)
         return child.value
 
 
-def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False):
+def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False):
     """One game; returns list of (features, pi, mask, z, enemy general cell [label only]) for both players, and result string."""
     state = env.init_state(key)
-    searcher = Searcher(net, h, w, max_steps, rng, belief)
-    rec, hist = [[], []], [None, None]
+    searcher = Searcher(net, h, w, max_steps, rng, belief, incremental)
+    rec, hist, hist_st = [[], []], [None, None], [None, None]
     while True:
         res = outcome(state, 0, max_steps)
         if res is not None:
@@ -475,8 +566,11 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False):
         acts = [None, None]
         for me in (0, 1):
             obs = get_observation(state, me)
-            counts = searcher.search(state, me, sims, hist[me])
+            counts = searcher.search(state, me, sims, hist[me], prev_st=hist_st[me])
             hist[me] = stack_with(hist[me], features(obs, hist[me]), net.frames)
+            if incremental:  # real turn: advance my recurrent state by the one new frame
+                with torch.no_grad():
+                    hist_st[me] = net.step(torch.from_numpy(hist[me][-1:]), hist_st[me])[1]
             pi = counts / counts.sum()
             temp = 1.0 if int(state.time) < 10 else 0.25
             p = pi ** (1 / temp)
@@ -531,6 +625,8 @@ def main(argv=None):
                     help="pisa = pyramid block-sparse attention; hybrid = GDN-2 over time + PISA over space")
     ap.add_argument("--frames", type=int, default=FRAMES, help="observation history length; long histories want --attn pisa")
     ap.add_argument("--belief", choices=("off", "on"), default="off", help="sample enemy general/land from the net's belief head")
+    ap.add_argument("--incremental", action="store_true",
+                    help="hybrid only: streaming net (GDN state carried across turns, search nodes store it); trains on window rebuilds")
     ap.add_argument("--size", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
@@ -539,21 +635,23 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.games < 1 or args.sims < 1 or args.size < 4 or args.max_steps < 1:
         ap.error("--games, --sims, --max-steps must be positive and --size at least 4")
+    if args.incremental and args.attn != "hybrid":
+        ap.error("--incremental needs --attn hybrid")
 
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     h = w = args.size
     env = make_env(h, args.max_steps)
-    net = Net(h, w, frames=args.frames, attn=args.attn)
+    net = Net(h, w, frames=args.frames, attn=args.attn, stream=args.incremental)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)
     buffer = deque(maxlen=4096)
     completed = 0
     if args.resume:
         checkpoint = load_checkpoint(args.output)
-        if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn", "frames")):
-            ap.error("resume requires matching --size, --sims, --max-steps, --seed, --attn and --frames")
+        if any(checkpoint["args"].get(name, False) != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn", "frames", "incremental")):
+            ap.error("resume requires matching --size, --sims, --max-steps, --seed, --attn, --frames and --incremental")
         net.load_state_dict(checkpoint["model"])
         opt.load_state_dict(checkpoint["optimizer"])
         rng.bit_generator.state = checkpoint["numpy_rng"]
@@ -563,7 +661,7 @@ def main(argv=None):
         completed = checkpoint["completed"]
     for g in range(completed, args.games):
         key, k = jrandom.split(key)
-        samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on")
+        samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on", args.incremental)
         buffer.extend(samples)
         indices = rng.choice(len(buffer), size=min(512, len(buffer)), replace=False)
         lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices])

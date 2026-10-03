@@ -50,7 +50,7 @@ class Ckpt:
         a = ck["args"]
         if a["size"] != size:
             raise SystemExit(f"checkpoint was trained for --size {a['size']}, not {size}")
-        self.net = az.Net(size, size, frames=a["frames"], attn=a["attn"])
+        self.net = az.Net(size, size, frames=a["frames"], attn=a["attn"], stream=a.get("incremental", False))
         self.net.load_state_dict(ck["model"])
         self.net.eval()
         self.sims, self.size = sims, size

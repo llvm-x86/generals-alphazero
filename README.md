@@ -125,8 +125,41 @@ hybrid took 4.61s, but it has only two attention layers against four in the
 dense/PISA rows, so that is not a like-for-like speed comparison, and nothing
 here shows it plays better. Simplifications versus the paper: no short
 convolution or output gate, and a plain PyTorch loop over frames instead of the
-chunkwise Triton kernels. The state is rebuilt from the frame window on every
-call; carrying it across turns for constant-cost search steps is not implemented.
+chunkwise Triton kernels. By default the state is rebuilt from the frame window on every
+call; see "Incremental hybrid" below for the opt-in streaming mode.
+
+### Incremental hybrid (`--attn hybrid --incremental`, opt-in)
+
+`Net(..., stream=True)` is a *streaming* variant: `forward` folds the window frame by
+frame from an empty state, and `Net.step(frame, state)` does the same for one new frame
+from a carried state. GDN layers carry `S` (fixed size, O(1) in history); PISA layers carry
+the last `frames-1` frames' cell keys/values and only the newest frame's tokens are queries
+(so, unlike the default net, old frames never see new ones: causal in time, all frames share
+one temporal embedding). Search nodes store the batch-2 (me, opponent) state, so a child costs
+one step; the root opponent state starts empty. Training uses `forward` on stored windows
+(a rebuild, zero initial state); self-play/search use the carried state.
+
+- Equal (`test_incremental_equals_window_rebuild_when_window_covers_game`, atol 1e-4 on
+  logits, value, belief): whenever the window holds every frame stepped so far.
+- **Not equal** once the game outlives the window (`test_incremental_state_outlives_the_window`):
+  the carried GDN `S` and cached PISA keys still contain pre-window frames (and everything
+  computed after them depends on that), while training and `eval_agents` rebuild from the
+  window only. So self-play/search with `--incremental` run on a different input distribution
+  than training once a game is longer than `--frames` turns (including the 4-turn-padded start, where
+  `stack_with` repeats frame 0 in the window but the carried state saw it once). Trained-only-on-windows
+  weights are not guaranteed to use long-range state well; this is not measured here.
+- The stream net is a different function from the default hybrid, so checkpoints are not interchangeable
+  (`args["incremental"]` is recorded; `bc_warmstart.py` does not support it).
+
+Per-step time, 1 thread, B=1, default width, median of 5 after one excluded cold call
+(throwaway script timing `net(window)` vs `net.step(frame, state)`):
+
+| board | frames | window rebuild | incremental step |
+|---|---|---|---|
+| 8x8 | 16 | 191.4 ms | 11.4 ms |
+| 8x8 | 64 | 980.4 ms | 15.9 ms |
+| 12x12 | 16 | 426.8 ms | 27.0 ms |
+| 12x12 | 64 | 2048.5 ms | 29.8 ms |
 
 `uv run proofs/information_flow.py` runs symengine checks of the layers' information
 flow (GDN-2 memory dynamics and contractivity, softmax logit gap dense vs PISA,

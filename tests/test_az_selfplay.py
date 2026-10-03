@@ -270,6 +270,53 @@ def test_hybrid_net_remembers_oldest_frame_and_trains():
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
 
 
+def _stream_net(frames, seed=5):
+    torch.manual_seed(seed)
+    return az.Net(6, 6, frames=frames, attn="hybrid", block=8, topk=2, stream=True).eval()
+
+
+def _step_all(net, x, with_belief=True):
+    state = None
+    with torch.no_grad():
+        for t in range(x.shape[1]):
+            out, state = net.step(x[:, t], state, with_belief)
+    return out
+
+
+def test_incremental_equals_window_rebuild_when_window_covers_game():
+    net, x = _stream_net(6), torch.randn(2, 6, az.CHANNELS, 6, 6)
+    with torch.no_grad():
+        want = net(x, True)
+    for a, b in zip(_step_all(net, x), want):  # logits, value, belief
+        assert torch.allclose(a, b, atol=1e-4)
+
+
+def test_incremental_state_outlives_the_window():
+    net, x = _stream_net(3), torch.randn(1, 6, az.CHANNELS, 6, 6)
+    with torch.no_grad():
+        rebuilt = net(x[:, -3:])  # the window only holds the last 3 of 6 frames
+    inc = _step_all(net, x, False)
+    assert not torch.allclose(inc[0], rebuilt[0], atol=1e-4)  # GDN state (and cached keys) still carry frames 0-2
+    assert torch.allclose(_step_all(net, x[:, -3:], False)[0], rebuilt[0], atol=1e-4)  # same once the history fits
+
+
+def test_incremental_search_child_costs_one_step_and_trains(tmp_path):
+    net = _stream_net(4)
+    state = az.make_env(6, 20).init_state(jr.PRNGKey(0))
+    s = az.Searcher(net, 6, 6, 20, np.random.default_rng(0), incremental=True)
+    root = s.make_node(state, 0)
+    assert root.st is not None
+    s.simulate(root, 0)
+    child = next(c for c, _ in root.children.values() if c is not None)
+    x = torch.from_numpy(np.stack([root.stack[-1], child.stack[-1]]))[None]  # child == fold the two frames
+    with torch.no_grad():
+        assert abs(float(net(x)[1]) - child.value) < 1e-4
+    out = tmp_path / "inc.pt"
+    az.main(["--games", "1", "--sims", "2", "--size", "6", "--max-steps", "3", "--attn", "hybrid", "--frames", "4",
+             "--incremental", "--belief", "on", "--output", str(out)])
+    assert az.load_checkpoint(out)["args"]["incremental"]
+
+
 def test_gdn2_scan_matches_symbolic_closed_form():
     """proofs/information_flow.py proves p_T = w sum_s lam^(T-s) v_s with lam = a(1-b) for unit k."""
     T, dk, dv = 7, 5, 3
