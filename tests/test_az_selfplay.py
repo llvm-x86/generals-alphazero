@@ -109,3 +109,41 @@ def test_net_is_spacetime_transformer_with_memory():
     out = net(y)
     assert not torch.allclose(out[0][:, :8], logits[:, :8])  # past frames reach current-cell logits
     assert not torch.allclose(out[1], value)
+
+def _dense_reference(layer, q, k, v, kg, vg):
+    """Exact attention over every cell plus the global token."""
+    keys, vals = torch.cat([kg, k], 2), torch.cat([vg, v], 2)
+    return torch.nn.functional.scaled_dot_product_attention(q, keys, vals)
+
+
+def test_pisa_equals_dense_when_every_block_is_kept():
+    torch.manual_seed(0)
+    layer = az.PisaLayer(32, 2, block=4, topk=16)  # topk >= number of leaf blocks
+    q, k, v = (torch.randn(2, 2, 21, 16) for _ in range(3))  # 21 cells: ragged last block + padded blocks
+    kg, vg = torch.randn(2, 2, 1, 16), torch.randn(2, 2, 1, 16)
+    assert torch.allclose(layer.sparse(q, k, v, kg, vg), _dense_reference(layer, q, k, v, kg, vg), atol=1e-5)
+
+
+def test_pisa_pyramid_finds_planted_key():
+    torch.manual_seed(1)
+    layer = az.PisaLayer(32, 2, block=4, topk=2)
+    n, d = 64, 16
+    q = torch.randn(1, 2, n, d)
+    k = torch.randn(1, 2, n, d) * 0.01
+    for pos in (5, 37, 62):  # needle in different regions of the pyramid
+        kk = k.clone()
+        kk[:, :, pos] = 60 * q[:, :, 0] / q[:, :, 0].norm(dim=-1, keepdim=True)
+        P = 16
+        valid = torch.ones(P * 4, dtype=torch.bool)
+        sel = layer.select(q[:, :, :1] * d ** -0.5, kk, valid, P)
+        assert sel.shape[-1] == 2 and pos // 4 in sel[0, 0].tolist()
+
+
+def test_pisa_net_trains_and_matches_shapes():
+    torch.manual_seed(2)
+    net = az.Net(6, 6, attn="pisa", block=4, topk=2)
+    x = torch.randn(2, az.FRAMES, az.CHANNELS, 6, 6)
+    logits, value = net(x)
+    assert logits.shape == (2, az.num_actions(6, 6)) and torch.isfinite(logits).all()
+    (logits.sum() + value.sum()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())

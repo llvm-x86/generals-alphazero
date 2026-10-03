@@ -128,6 +128,81 @@ def determinize(state, me, rng):
     )
 
 
+class PisaLayer(nn.Module):
+    """Pre-norm transformer layer with Pyramid Sparse Attention (PISA, arXiv 2609.31093).
+
+    Cell tokens (token 0 is the global token) pick their `topk` key blocks of
+    `block` tokens by coarse-to-fine search over a mean-pooled key pyramid,
+    scoring candidates with LogSumExp, so selection costs O(N log N) rather than
+    O(N^2 / block). Selection is shared by all heads (summed LSE) and is not
+    differentiated; attention itself runs on the original keys/values. Every
+    cell also always attends to the global token, which attends densely to all.
+    Differences from the paper: bidirectional (no causal 'forced blocks'), no
+    GQA, and plain PyTorch gathers instead of fused Triton kernels."""
+
+    def __init__(self, width, heads, block=16, topk=4):
+        super().__init__()
+        self.h, self.block, self.topk = heads, block, topk
+        self.n1, self.n2 = nn.LayerNorm(width), nn.LayerNorm(width)
+        self.qkv, self.proj = nn.Linear(width, 3 * width), nn.Linear(width, width)
+        self.mlp = nn.Sequential(nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width))
+
+    def forward(self, x):  # (B, 1 + N, width)
+        b, n, width = x.shape
+        q, k, v = self.qkv(self.n1(x)).reshape(b, n, 3, self.h, width // self.h).permute(2, 0, 3, 1, 4)
+        out_g = F.scaled_dot_product_attention(q[:, :, :1], k, v)
+        out_c = self.sparse(q[:, :, 1:], k[:, :, 1:], v[:, :, 1:], k[:, :, :1], v[:, :, :1])
+        x = x + self.proj(torch.cat([out_g, out_c], 2).transpose(1, 2).reshape(b, n, width))
+        return x + self.mlp(self.n2(x))
+
+    def sparse(self, q, k, v, kg, vg):
+        B, H, N, d = q.shape
+        C = self.block
+        P = 1 << (-(-N // C) - 1).bit_length()  # leaf blocks padded to a power of two
+        pad = P * C - N
+        valid = F.pad(torch.ones(N, dtype=torch.bool), (0, pad))
+        k, v = F.pad(k, (0, 0, 0, pad)), F.pad(v, (0, 0, 0, pad))
+        with torch.no_grad():
+            sel = self.select(q * d ** -0.5, k, valid, P)  # (B, N, S) leaf-block ids
+        S = sel.shape[-1]
+        idx = sel.reshape(B, 1, N * S, 1, 1).expand(B, H, -1, C, d)
+        ks = k.reshape(B, H, P, C, d).gather(2, idx).reshape(B, H, N, S * C, d)
+        vs = v.reshape(B, H, P, C, d).gather(2, idx).reshape(B, H, N, S * C, d)
+        ok = valid.reshape(P, C)[sel].reshape(B, N, S * C)
+        ks = torch.cat([ks, kg.reshape(B, H, 1, 1, d).expand(B, H, N, 1, d)], 3)
+        vs = torch.cat([vs, vg.reshape(B, H, 1, 1, d).expand(B, H, N, 1, d)], 3)
+        ok = torch.cat([ok, torch.ones(B, N, 1, dtype=torch.bool)], -1)
+        return F.scaled_dot_product_attention(q.unsqueeze(3), ks, vs, attn_mask=ok[:, None, :, None]).squeeze(3)
+
+    def select(self, q, k, valid, P):
+        """Pyramid top-K: returns (B, N, <=topk) leaf-block indices per query."""
+        B, H, N, d = q.shape
+        C, K = self.block, self.topk
+        sums = [None, (k * valid[:, None]).reshape(B, H, P, C, d).sum(3)]
+        cnts = [None, valid.reshape(P, C).sum(1)]
+        while sums[-1].shape[2] > 1:  # fine-to-coarse mean pooling (as sum / valid count)
+            sums.append(sums[-1].reshape(B, H, -1, 2, d).sum(3))
+            cnts.append(cnts[-1].reshape(-1, 2).sum(1))
+        means = [None] + [s / c.clamp(min=1)[:, None] for s, c in zip(sums[1:], cnts[1:])]
+
+        def top(A, u):  # keep the K best-scoring candidates
+            return A.gather(-1, u.topk(K, -1).indices)
+
+        A = torch.zeros(B, N, 1, dtype=torch.long)
+        for lvl in range(len(sums) - 1, 1, -1):  # coarsest level down to 2
+            if A.shape[-1] > K:
+                ch = torch.stack([2 * A, 2 * A + 1], -1)  # children at level lvl-1: (B, N, a, 2)
+                g = means[lvl - 1].gather(2, ch.reshape(B, 1, -1, 1).expand(B, H, -1, d)).reshape(B, H, N, -1, 2, d)
+                lg = torch.einsum("bhnd,bhnasd->bhnas", q, g).masked_fill(~(cnts[lvl - 1][ch] > 0)[:, None], -torch.inf)
+                A = top(A, torch.logsumexp(lg, -1).sum(1))
+            A = torch.stack([2 * A, 2 * A + 1], -1).flatten(-2)
+        if A.shape[-1] > K:  # leaf blocks: exact LSE over their original keys
+            g = k.reshape(B, H, P, C, d).gather(2, A.reshape(B, 1, -1, 1, 1).expand(B, H, -1, C, d)).reshape(B, H, N, -1, C, d)
+            lg = torch.einsum("bhnd,bhnacd->bhnac", q, g).masked_fill(~valid.reshape(P, C)[A][:, None], -torch.inf)
+            A = top(A, torch.logsumexp(lg, -1).sum(1))
+        return A
+
+
 class Net(nn.Module):
     """Pixel-level spacetime transformer: one token per cell per frame, no pooling.
 
@@ -135,15 +210,18 @@ class Net(nn.Module):
     attention can recall earlier sightings. A learned global token feeds the
     value and pass heads; the policy comes from each current-frame cell token."""
 
-    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES):
+    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4):
         super().__init__()
         self.cells = h * w
         self.inp = nn.Linear(CHANNELS, width)
         self.pos = nn.Parameter(torch.randn(1, 1, h * w, width) * 0.02)
         self.tpos = nn.Parameter(torch.randn(1, frames, 1, width) * 0.02)
         self.glob = nn.Parameter(torch.zeros(1, 1, width))
-        layer = nn.TransformerEncoderLayer(width, heads, 4 * width, dropout=0.0, batch_first=True, norm_first=True)
-        self.body = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+        if attn == "pisa":
+            self.body = nn.Sequential(*[PisaLayer(width, heads, block, topk) for _ in range(layers)])
+        else:
+            layer = nn.TransformerEncoderLayer(width, heads, 4 * width, dropout=0.0, batch_first=True, norm_first=True)
+            self.body = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(width)
         self.pol = nn.Linear(width, 8)  # per cell: 4 dirs x 2 splits
         self.pass_logit = nn.Linear(width, 1)
@@ -307,6 +385,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--games", type=int, default=8)
     ap.add_argument("--sims", type=int, default=32)
+    ap.add_argument("--attn", choices=("dense", "pisa"), default="dense",
+                    help="pisa = pyramid block-sparse attention; only pays off on large boards")
     ap.add_argument("--size", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
@@ -321,15 +401,15 @@ def main(argv=None):
     rng = np.random.default_rng(args.seed)
     h = w = args.size
     env = GeneralsEnv(grid_dims=(h, w), truncation=args.max_steps, general_trade=True)
-    net = Net(h, w)
+    net = Net(h, w, attn=args.attn)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)
     buffer = deque(maxlen=4096)
     completed = 0
     if args.resume:
         checkpoint = torch.load(args.output, map_location="cpu", weights_only=True)
-        if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed")):
-            ap.error("resume requires matching --size, --sims, --max-steps and --seed")
+        if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn")):
+            ap.error("resume requires matching --size, --sims, --max-steps, --seed and --attn")
         net.load_state_dict(checkpoint["model"])
         opt.load_state_dict(checkpoint["optimizer"])
         rng.bit_generator.state = checkpoint["numpy_rng"]
