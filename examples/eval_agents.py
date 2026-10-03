@@ -45,8 +45,8 @@ class Builtin:
 class Ckpt:
     """az_selfplay checkpoint. sims=0: argmax of the masked policy; sims>0: most-visited PUCT root action."""
 
-    def __init__(self, path, sims, max_steps, size):
-        ck = torch.load(path, map_location="cpu", weights_only=True)
+    def __init__(self, path, sims, max_steps, size, belief=False):
+        ck = az.load_checkpoint(path)
         a = ck["args"]
         if a["size"] != size:
             raise SystemExit(f"checkpoint was trained for --size {a['size']}, not {size}")
@@ -55,7 +55,7 @@ class Ckpt:
         self.net.eval()
         self.sims, self.size = sims, size
         self.rng = np.random.default_rng(0)
-        self.searcher = az.Searcher(self.net, size, size, max_steps, self.rng)
+        self.searcher = az.Searcher(self.net, size, size, max_steps, self.rng, belief)
         self.hist = None
 
     def reset(self):
@@ -68,16 +68,16 @@ class Ckpt:
             a = int(np.argmax(counts))
         else:
             mask = az.legal_mask(obs, self.size, self.size)
-            stack = az.stack_with(self.hist, az.features(obs), self.net.frames)
+            stack = az.stack_with(self.hist, az.features(obs, self.hist), self.net.frames)
             p, _ = az.evaluate(self.net, [stack], [mask])
             a = int(np.argmax(p[0]))
-        self.hist = az.stack_with(self.hist, az.features(obs), self.net.frames)
+        self.hist = az.stack_with(self.hist, az.features(obs, self.hist), self.net.frames)
         return np.asarray(az.decode(a, self.size, self.size))
 
 
-def make_agent(name, sims, max_steps, size):
+def make_agent(name, sims, max_steps, size, belief=False):
     if name.startswith("ckpt:"):
-        return Ckpt(name[5:], sims, max_steps, size)
+        return Ckpt(name[5:], sims, max_steps, size, belief)
     if name not in BUILTIN:
         raise SystemExit(f"unknown agent {name!r}; choose from {sorted(BUILTIN)} or ckpt:<path>")
     return Builtin(BUILTIN[name])
@@ -105,9 +105,9 @@ def play(env, agents, state, key, max_steps):
     return win, float(az.outcome(state, 0, max_steps))
 
 
-def run(name_a, name_b, size, games, max_steps, seed, sims=0):
+def run(name_a, name_b, size, games, max_steps, seed, sims=0, belief=False):
     env = az.make_env(size, max_steps)
-    a, b = make_agent(name_a, sims, max_steps, size), make_agent(name_b, sims, max_steps, size)
+    a, b = make_agent(name_a, sims, max_steps, size, belief), make_agent(name_b, sims, max_steps, size, belief)
     real, adj = np.zeros(3, int), np.zeros(3, int)  # A's [wins, losses, draws]
     for g in range(games):
         a_seat = g % 2
@@ -140,11 +140,12 @@ def main(argv=None):
     ap.add_argument("--max-steps", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sims", type=int, default=0, help="PUCT simulations per ckpt move (0 = policy argmax)")
+    ap.add_argument("--belief", action="store_true", help="ckpt agents sample determinizations from the belief head")
     args = ap.parse_args(argv)
     if args.games < 1 or args.size < 4 or args.max_steps < 1 or args.sims < 0:
         ap.error("need --games >= 1, --size >= 4, --max-steps >= 1, --sims >= 0")
     torch.set_num_threads(1)
-    real, adj = run(args.agent_a, args.agent_b, args.size, args.games, args.max_steps, args.seed, args.sims)
+    real, adj = run(args.agent_a, args.agent_b, args.size, args.games, args.max_steps, args.seed, args.sims, args.belief)
     print(f"{args.agent_a} (A) vs {args.agent_b} (B): {args.games} games on {args.size}x{args.size}, "
           f"max_steps {args.max_steps}, seeds {args.seed}..{args.seed + (args.games - 1) // 2}, sims {args.sims}")
     report("real outcomes (truncation = draw)", args.agent_a, args.agent_b, real, args.games)

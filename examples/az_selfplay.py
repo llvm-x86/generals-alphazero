@@ -15,8 +15,10 @@ What it is
   * Unfinished games at --max-steps receive a bounded score-advantage proxy
     (not a win); games ending in a general capture use +1/-1.
 
-Belief limitation: sampled fog tiles do not preserve remembered terrain or
-past sightings; the opponent model is sampled rather than adversarial search.
+Memory: each frame carries ever-seen / last-seen enemy / last-seen terrain / sticky general-sighting
+planes. An auxiliary belief head predicts the enemy general's cell (trained only while it is unseen;
+the true cell is a label, never an input); --belief on makes determinize() sample from it.
+The opponent model is sampled rather than adversarial search.
 This is not a ranked-ready agent. Evaluate separately before live play.
 """
 import argparse
@@ -36,7 +38,8 @@ from generals.core.action import compute_valid_move_mask_obs
 from generals.core.game import step as game_step
 
 C_PUCT = 1.5
-CHANNELS = 15
+CHANNELS = 20  # 15 current-view planes + 5 memory planes (see features)
+BELIEF_WEIGHT = 0.1  # auxiliary enemy-general cross-entropy weight in train_step
 FRAMES = 4  # default number of past own-observation frames the net attends over (fog memory)
 
 
@@ -59,8 +62,12 @@ def decode(idx, h, w):
     return [0, cell // w, cell % w, rest // 2, rest % 2]
 
 
-def features(obs):
-    """Fog observation -> (CHANNELS, H, W) float array. Own view only."""
+def features(obs, prev=None):
+    """Fog observation -> (CHANNELS, H, W) float array. Own view only.
+
+    `prev` is this player's (n, C, H, W) history; its newest frame carries the memory planes
+    (15 ever-seen, 16 last-seen enemy cells, 17 last-seen mountains, 18 last-seen castles,
+    19 sticky enemy-general sighting), which are updated from the current view."""
     a = np.asarray(obs.armies, dtype=np.float32)
     planes = [np.log1p(a) / 5.0 * np.asarray(obs.owned_cells), np.log1p(a) / 5.0 * np.asarray(obs.opponent_cells),
               np.log1p(a) / 5.0 * np.asarray(obs.neutral_cells)]
@@ -70,7 +77,20 @@ def features(obs):
     counts = (obs.owned_land_count, obs.owned_army_count, obs.opponent_land_count, obs.opponent_army_count)
     planes += [np.full(a.shape, np.log1p(float(v)) / 5.0, dtype=np.float32) for v in counts]
     planes.append(np.full(a.shape, float(obs.timestep) / 500.0, dtype=np.float32))
-    return np.stack(planes)
+    old = np.zeros((5,) + a.shape, np.float32) if prev is None else prev[-1, 15:]
+    vis = ~np.asarray(obs.fog_cells | obs.structures_in_fog)
+    new = np.stack([vis, np.asarray(obs.opponent_cells), np.asarray(obs.mountains), np.asarray(obs.castles),
+                    np.asarray(obs.generals & obs.opponent_cells)])
+    planes += [np.maximum(old[0], vis), np.where(vis, new[1], old[1]), np.where(vis, new[2], old[2]),
+               np.where(vis, new[3], old[3]), np.maximum(old[4], new[4])]
+    return np.stack(planes).astype(np.float32)
+
+
+def belief_support(x):
+    """(B, C, H, W) newest frames -> (B, H*W) bool: cells the enemy general can still occupy
+    (not own, never seen -- the general never moves -- and not a known mountain/castle)."""
+    keep = (x[:, 6] < .5) & (x[:, 15] < .5) & (x[:, 17] < .5) & (x[:, 18] < .5) & (x[:, 5] < .5)
+    return keep.flatten(1)
 
 
 def legal_mask(obs, h, w):
@@ -100,8 +120,12 @@ def castle_fraction(size):
     return CASTLE_FRACTION[min(CASTLE_FRACTION, key=lambda k: abs(k - size))]
 
 
-def determinize(state, me, rng):
-    """Sample a board from one player's observation, never from hidden tiles."""
+def determinize(state, me, rng, belief=None, seen=None):
+    """Sample a board from one player's observation, never from hidden tiles.
+
+    belief: optional (H*W,) probabilities over the enemy general's cell (from the net, own view only);
+    seen: optional (H, W) ever-seen mask from this player's memory planes. With belief the general is
+    drawn from it, hidden enemy land is biased toward it, and ever-seen cells leave the land support."""
     obs = get_observation(state, me)
     fog = np.asarray(obs.fog_cells | obs.structures_in_fog)
     armies = np.asarray(obs.armies).copy()
@@ -110,8 +134,21 @@ def determinize(state, me, rng):
     # Fogged structures are almost never enemy-owned castles, so enemy land goes on plain hidden tiles first.
     hidden = np.flatnonzero(fog & ~np.asarray(obs.structures_in_fog))
     unseen_land = max(0, int(obs.opponent_land_count) - int(enemy.sum()))
-    # ponytail: uniform hidden-land prior; use a learned belief model once replay data justifies it.
-    chosen = rng.choice(hidden, size=min(unseen_land, len(hidden)), replace=False)
+    gen_cell = None
+    if belief is not None and not (np.asarray(obs.generals) & enemy).any() and len(hidden) and unseen_land:
+        fresh = hidden[~np.asarray(seen).flat[hidden]] if seen is not None else hidden
+        support = fresh if len(fresh) else hidden
+        pg = np.asarray(belief, np.float64)[support]
+        gen_cell = int(rng.choice(support, p=pg / pg.sum() if pg.sum() > 0 else None))
+        rest = support[support != gen_cell]
+        if len(rest) < unseen_land - 1:  # not enough never-seen cells: fall back to all hidden
+            rest = hidden[hidden != gen_cell]
+        near = np.abs(rest // enemy.shape[1] - gen_cell // enemy.shape[1]) + np.abs(rest % enemy.shape[1] - gen_cell % enemy.shape[1])
+        wt = 1.0 / (1.0 + near)
+        k = min(unseen_land - 1, len(rest))
+        chosen = np.concatenate([[gen_cell], rng.choice(rest, size=k, replace=False, p=wt / wt.sum())]).astype(int)
+    else:
+        chosen = rng.choice(hidden, size=min(unseen_land, len(hidden)), replace=False)
     enemy.flat[chosen] = True
     mountains = np.asarray(obs.mountains).copy()
     castles = np.asarray(obs.castles).copy()
@@ -132,6 +169,9 @@ def determinize(state, me, rng):
         positions[me] = own_general[0]
     if len(enemy_general):
         positions[1 - me] = enemy_general[0]
+    elif gen_cell is not None:
+        positions[1 - me] = np.unravel_index(gen_cell, own.shape)
+        generals[tuple(positions[1 - me])] = True
     elif len(chosen):
         candidates = chosen[~structures.flat[chosen]]
         positions[1 - me] = np.unravel_index(rng.choice(candidates if len(candidates) else chosen), own.shape)
@@ -302,16 +342,22 @@ class Net(nn.Module):
         self.norm = nn.LayerNorm(width)
         self.pol = nn.Linear(width, 8)  # per cell: 4 dirs x 2 splits
         self.pass_logit = nn.Linear(width, 1)
+        self.bel = nn.Linear(width, 1)  # per cell: enemy-general location logit
         self.val = nn.Sequential(nn.Linear(width, 32), nn.ReLU(), nn.Linear(32, 1), nn.Tanh())
 
-    def forward(self, x):
+    def forward(self, x, with_belief=False):
+        """(policy logits, value), plus masked (B, H*W) belief logits when with_belief."""
         b, t = x.shape[:2]
         tok = self.inp(x.flatten(3).transpose(2, 3)) + self.pos + self.tpos  # (B, T, H*W, width)
         tok = tok.reshape(b, t * self.cells, -1)
         tok = self.norm(self.body(torch.cat([self.glob.expand(b, -1, -1), tok], 1)))
         g, cur = tok[:, 0], tok[:, -self.cells:]  # last frame's cells
         logits = self.pol(cur).reshape(b, -1)  # (B, H*W*8), cell-major
-        return torch.cat([logits, self.pass_logit(g)], 1), self.val(g).squeeze(1)
+        out = torch.cat([logits, self.pass_logit(g)], 1), self.val(g).squeeze(1)
+        if not with_belief:
+            return out
+        bel = self.bel(cur).squeeze(2).masked_fill(~belief_support(x[:, -1]), -1e9)
+        return out + (bel,)
 
 
 @torch.no_grad()
@@ -348,23 +394,29 @@ def outcome(state, me, max_steps):
 
 
 class Searcher:
-    def __init__(self, net, h, w, max_steps, rng):
-        self.net, self.h, self.w, self.max_steps, self.rng = net, h, w, max_steps, rng
+    def __init__(self, net, h, w, max_steps, rng, belief=False):
+        self.net, self.h, self.w, self.max_steps, self.rng, self.belief = net, h, w, max_steps, rng, belief
 
     def make_node(self, state, me, prev=None, opp_prev=None):
         obs = [get_observation(state, me), get_observation(state, 1 - me)]
         masks = [legal_mask(o, self.h, self.w) for o in obs]
         # ponytail: the opponent's true history is unknown to us; it starts as a repeat of its current frame.
         n = self.net.frames
-        stacks = [stack_with(prev, features(obs[0]), n), stack_with(opp_prev, features(obs[1]), n)]
+        stacks = [stack_with(prev, features(obs[0], prev), n), stack_with(opp_prev, features(obs[1], opp_prev), n)]
         p, v = evaluate(self.net, stacks, masks)
         return Node(state, p[0], p[1], float(v[0]), *stacks)
 
     def search(self, state, me, sims, prev=None, noise=True):
         counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
         roots = min(4, sims)
+        bel = seen = None
+        if self.belief:  # own fog view + memory only
+            stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
+            with torch.no_grad():
+                logits = self.net(torch.from_numpy(stack[None]), True)[2][0]
+            bel, seen = F.softmax(logits, 0).numpy(), stack[-1, 15] > 0.5
         for i in range(roots):
-            root = self.make_node(determinize(state, me, self.rng), me, prev)
+            root = self.make_node(determinize(state, me, self.rng, bel, seen), me, prev)
             if noise:
                 legal = np.flatnonzero(root.prior > 0)
                 root.prior = root.prior.copy()
@@ -411,10 +463,10 @@ class Searcher:
         return child.value
 
 
-def self_play(net, h, w, sims, max_steps, key, rng, env):
-    """One game; returns list of (features, pi, mask, z) for both players, and result string."""
+def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False):
+    """One game; returns list of (features, pi, mask, z, enemy general cell [label only]) for both players, and result string."""
     state = env.init_state(key)
-    searcher = Searcher(net, h, w, max_steps, rng)
+    searcher = Searcher(net, h, w, max_steps, rng, belief)
     rec, hist = [[], []], [None, None]
     while True:
         res = outcome(state, 0, max_steps)
@@ -424,18 +476,18 @@ def self_play(net, h, w, sims, max_steps, key, rng, env):
         for me in (0, 1):
             obs = get_observation(state, me)
             counts = searcher.search(state, me, sims, hist[me])
-            hist[me] = stack_with(hist[me], features(obs), net.frames)
+            hist[me] = stack_with(hist[me], features(obs, hist[me]), net.frames)
             pi = counts / counts.sum()
             temp = 1.0 if int(state.time) < 10 else 0.25
             p = pi ** (1 / temp)
             a = int(rng.choice(len(p), p=p / p.sum()))
             acts[me] = decode(a, h, w)
-            rec[me].append((hist[me], pi.astype(np.float32), legal_mask(obs, h, w)))
+            rec[me].append((hist[me], pi.astype(np.float32), legal_mask(obs, h, w), int(state.general_positions[1 - me][0]) * w + int(state.general_positions[1 - me][1])))
         state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
     samples = []
     for me in (0, 1):
         z = outcome(state, me, max_steps)
-        samples += [(f, pi, m, z) for f, pi, m in rec[me]]
+        samples += [(f, pi, m, z, g) for f, pi, m, g in rec[me]]
     result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else f"score-adjudicated {res:+.3f}"
     return samples, result
 
@@ -445,18 +497,30 @@ def train_step(net, opt, samples, epochs=2, batch=64):
     pi = torch.from_numpy(np.stack([s[1] for s in samples]))
     m = torch.from_numpy(np.stack([s[2] for s in samples]))
     z = torch.tensor([s[3] for s in samples], dtype=torch.float32)
+    gen = torch.tensor([s[4] for s in samples])
     for _ in range(epochs):
         perm = torch.randperm(len(x))
         for i in range(0, len(x), batch):
             j = perm[i:i + batch]
-            logits, v = net(x[j])
+            logits, v, bel = net(x[j], True)
             logp = F.log_softmax(logits.masked_fill(~m[j], -1e9), 1)
             loss_p = -(pi[j] * logp).sum(1).mean()
             loss_v = F.mse_loss(v, z[j])
+            unseen = x[j][:, -1, 19].flatten(1).sum(1) < .5  # label used only while the general is unseen
+            ce = F.cross_entropy(bel, gen[j], reduction="none")
+            loss_b = (ce * unseen).sum() / unseen.sum().clamp(min=1)
             opt.zero_grad()
-            (loss_p + loss_v).backward()
+            (loss_p + loss_v + BELIEF_WEIGHT * loss_b).backward()
             opt.step()
     return loss_p.item(), loss_v.item()
+
+
+def load_checkpoint(path):
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    if ck.get("channels") != CHANNELS:
+        raise ValueError(f"{path}: checkpoint has {ck.get('channels', 'no channels record (pre-memory planes)')} "
+                         f"input channels, this code uses {CHANNELS}; retrain or use matching code")
+    return ck
 
 
 def main(argv=None):
@@ -466,6 +530,7 @@ def main(argv=None):
     ap.add_argument("--attn", choices=("dense", "pisa", "hybrid"), default="dense",
                     help="pisa = pyramid block-sparse attention; hybrid = GDN-2 over time + PISA over space")
     ap.add_argument("--frames", type=int, default=FRAMES, help="observation history length; long histories want --attn pisa")
+    ap.add_argument("--belief", choices=("off", "on"), default="off", help="sample enemy general/land from the net's belief head")
     ap.add_argument("--size", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
@@ -486,7 +551,7 @@ def main(argv=None):
     buffer = deque(maxlen=4096)
     completed = 0
     if args.resume:
-        checkpoint = torch.load(args.output, map_location="cpu", weights_only=True)
+        checkpoint = load_checkpoint(args.output)
         if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn", "frames")):
             ap.error("resume requires matching --size, --sims, --max-steps, --seed, --attn and --frames")
         net.load_state_dict(checkpoint["model"])
@@ -494,20 +559,20 @@ def main(argv=None):
         rng.bit_generator.state = checkpoint["numpy_rng"]
         torch.set_rng_state(checkpoint["torch_rng"])
         key = jnp.asarray(checkpoint["jax_key"].numpy(), dtype=jnp.uint32)
-        buffer.extend((f.numpy(), pi.numpy(), m.numpy(), z) for f, pi, m, z in checkpoint["replay"])
+        buffer.extend((f.numpy(), pi.numpy(), m.numpy(), z, g) for f, pi, m, z, g in checkpoint["replay"])
         completed = checkpoint["completed"]
     for g in range(completed, args.games):
         key, k = jrandom.split(key)
-        samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env)
+        samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on")
         buffer.extend(samples)
         indices = rng.choice(len(buffer), size=min(512, len(buffer)), replace=False)
         lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices])
         checkpoint = {
-            "model": net.state_dict(), "optimizer": opt.state_dict(), "args": vars(args),
+            "model": net.state_dict(), "optimizer": opt.state_dict(), "args": vars(args), "channels": CHANNELS,
             "numpy_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
             "jax_key": torch.from_numpy(np.asarray(key).copy()), "completed": g + 1,
-            "replay": [(torch.from_numpy(f), torch.from_numpy(pi), torch.from_numpy(m), z)
-                       for f, pi, m, z in buffer],
+            "replay": [(torch.from_numpy(f), torch.from_numpy(pi), torch.from_numpy(m), z, g)
+                       for f, pi, m, z, g in buffer],
         }
         torch.save(checkpoint, args.output + ".tmp")
         os.replace(args.output + ".tmp", args.output)

@@ -52,6 +52,69 @@ def test_search_cannot_read_hidden_general_position():
     visits = [az.Searcher(net, 8, 8, 12, np.random.default_rng(5)).search(s, 0, 8, noise=False)
               for s in (first, second)]
     assert np.array_equal(*visits)
+    on = [az.Searcher(net, 8, 8, 12, np.random.default_rng(5), belief=True).search(s, 0, 8, noise=False)
+          for s in (first, second)]
+    assert np.array_equal(*on)
+    bel = np.random.default_rng(0).random(64)
+    seen = np.zeros((8, 8), bool)
+    guessed = [az.determinize(s, 0, np.random.default_rng(3), bel, seen) for s in (first, second)]
+    for field in ("armies", "ownership", "generals", "general_positions", "passable"):
+        assert np.array_equal(getattr(guessed[0], field), getattr(guessed[1], field))
+
+
+def test_memory_planes_update_on_hand_built_sequence():
+    grid = jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2).at[1, 1].set(-2)
+    state = game.create_initial_state(grid)
+    obs = game.get_observation(state, 0)
+    f0 = az.features(obs)
+    assert f0[15, 0, 0] == 1 and f0[15, 5, 5] == 0  # own corner seen, far corner not
+    assert f0[17, 1, 1] == 1  # adjacent mountain remembered
+    # the next observation has the mountain's cell and the origin visible again but the general far away:
+    # memory must carry planes from the previous stack, and never lose a sighting.
+    far = game.get_observation(state, 0)._replace(
+        fog_cells=jnp.ones((6, 6), bool), structures_in_fog=jnp.zeros((6, 6), bool),
+        mountains=jnp.zeros((6, 6), bool), opponent_cells=jnp.zeros((6, 6), bool))
+    f1 = az.features(far, az.stack_with(None, f0, 2))
+    assert f1[15, 0, 0] == 1 and f1[17, 1, 1] == 1  # remembered while fogged
+    assert f1[8, 0, 0] == 1  # current view really is fogged
+    # enemy general sighting is sticky and last-seen enemy cells follow visibility
+    seen_enemy = game.get_observation(state, 0)._replace(
+        opponent_cells=jnp.zeros((6, 6), bool).at[3, 3].set(True),
+        generals=jnp.zeros((6, 6), bool).at[3, 3].set(True),
+        fog_cells=jnp.zeros((6, 6), bool), structures_in_fog=jnp.zeros((6, 6), bool))
+    f2 = az.features(seen_enemy, az.stack_with(None, f1, 2))
+    assert f2[19].sum() == 1 and f2[19, 3, 3] == 1 and f2[16, 3, 3] == 1
+    f3 = az.features(far, az.stack_with(None, f2, 2))
+    assert f3[19, 3, 3] == 1 and f3[16, 3, 3] == 1  # still remembered once fogged again
+
+
+def test_belief_is_masked_and_determinize_places_general_from_it():
+    net = az.Net(6, 6)
+    x = torch.zeros(1, az.FRAMES, az.CHANNELS, 6, 6)
+    x[:, -1, 15, :2] = 1  # top two rows ever seen
+    x[:, -1, 6, 5, 5] = 1  # own cell
+    bel = net(x, True)[2][0].reshape(6, 6)
+    assert (bel[:2] < -1e8).all() and bel[5, 5] < -1e8 and (bel[2:5] > -1e8).all()
+    grid = jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2)
+    state = game.create_initial_state(grid)
+    point = np.zeros(36)
+    point[3 * 6 + 4] = 1  # all belief mass on (3, 4)
+    sample = az.determinize(state, 0, np.random.default_rng(0), point, np.zeros((6, 6), bool))
+    assert tuple(np.asarray(sample.general_positions[1])) == (3, 4)
+    assert bool(sample.ownership[1][3, 4])
+
+
+def test_incompatible_checkpoint_rejected(tmp_path):
+    out = tmp_path / "c.pt"
+    az.main(["--games", "1", "--sims", "1", "--size", "4", "--max-steps", "3", "--output", str(out)])
+    assert az.load_checkpoint(out)["channels"] == az.CHANNELS
+    ck = torch.load(out, weights_only=True)
+    del ck["channels"]  # what a pre-memory-planes checkpoint looks like
+    torch.save(ck, out)
+    with pytest.raises(ValueError, match="input channels"):
+        az.load_checkpoint(out)
+    with pytest.raises(ValueError, match="input channels"):
+        az.main(["--games", "2", "--sims", "1", "--size", "4", "--max-steps", "3", "--output", str(out), "--resume"])
 
 
 def test_truncation_is_score_proxy_not_draw():
@@ -143,9 +206,9 @@ def test_pisa_net_trains_and_matches_shapes():
     torch.manual_seed(2)
     net = az.Net(6, 6, attn="pisa", block=4, topk=2)
     x = torch.randn(2, az.FRAMES, az.CHANNELS, 6, 6)
-    logits, value = net(x)
+    logits, value, bel = net(x, True)
     assert logits.shape == (2, az.num_actions(6, 6)) and torch.isfinite(logits).all()
-    (logits.sum() + value.sum()).backward()
+    (logits.sum() + value.sum() + bel.clamp(min=-1e3).sum()).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
 
 
@@ -202,8 +265,8 @@ def test_hybrid_net_remembers_oldest_frame_and_trains():
     y[:, 0, :, 0, 0] += 3  # oldest frame, cell (0, 0): reaches current-cell logits via the GDN state
     assert not torch.allclose(net(y)[0][:, :8], logits[:, :8])
     net.train()
-    out, v = net(x)
-    (out.sum() + v.sum()).backward()
+    out, v, bel = net(x, True)
+    (out.sum() + v.sum() + bel.clamp(min=-1e3).sum()).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
 
 

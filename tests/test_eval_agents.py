@@ -21,7 +21,7 @@ def test_run_counts_and_ckpt_paths(tmp_path):
     assert real.sum() == adj.sum() == 4
     assert adj[2] <= real[2]  # adjudication only ever resolves draws
     ck = tmp_path / "u.pt"
-    torch.save({"model": ev.az.Net(5, 5).state_dict(), "args": {"size": 5, "attn": "dense", "frames": 4}}, ck)
+    torch.save({"model": ev.az.Net(5, 5).state_dict(), "args": {"size": 5, "attn": "dense", "frames": 4}, "channels": ev.az.CHANNELS}, ck)
     for sims in (0, 2):  # policy argmax and PUCT
         real, adj = ev.run(f"ckpt:{ck}", "random", 5, 2, 8, 0, sims)
         assert real.sum() == adj.sum() == 2
