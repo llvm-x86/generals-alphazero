@@ -57,13 +57,24 @@ on held-out maps and strong opponents before any live use. Checkpoints are
 saved atomically after each game; load only checkpoints you trust.
 `--attn pisa` swaps dense attention for a pure-PyTorch implementation of
 [PISA](https://arxiv.org/abs/2609.31093) (pyramid top-K block-sparse attention;
-mean-pooled key pyramid, LogSumExp-scored coarse-to-fine block selection). Tests
-confirm it equals dense attention when all blocks are kept and that the pyramid
-finds a planted key. **It is slower than dense on CPU at every size measured**
-(1 thread, 4 layers, width 64, batch 1: 10x10 0.27s vs 0.011s; 20x20 1.10s vs
-0.28s; 30x30 1.90s vs 1.12s). The paper relies on fused Triton GPU kernels,
-which this does not have. Keep the default `dense` unless you port it to a GPU
-kernel and re-measure. Dense and PISA checkpoints are not interchangeable.
+mean-pooled key pyramid, LogSumExp-scored coarse-to-fine block selection).
+Tokens are ordered frame-major, so PISA also spans the history axis:
+`--frames N` sets how many past own-observation frames the net attends over
+(default 4). Tests confirm PISA equals dense attention when all blocks are kept
+and that the pyramid finds a planted key. Measured on CPU (1 thread, 4 layers,
+width 64, batch 1, single cold forward pass, so noisy), 30x30 board:
+
+| history | tokens | dense | PISA |
+|---|---|---|---|
+| 4 frames | 3,601 | 1.32s | 3.65s |
+| 8 frames | 7,201 | 4.90s | 7.11s |
+| 16 frames | 14,401 | 20.63s | 11.91s |
+
+PISA is slower than dense for short sequences and wins only for long
+board-times-history sequences (here from about 16 frames at 30x30). It has no
+fused Triton GPU kernel, and replay storage grows linearly with `--frames`
+(16 frames at 30x30 is about 0.9 MB per sample). Dense and PISA checkpoints, and
+checkpoints with different `--frames`, are not interchangeable.
 
 Earlier one-off checkpoints lack optimizer/RNG state and use a different input
 shape; start a fresh run rather than using `--resume` on them.

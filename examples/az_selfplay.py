@@ -37,13 +37,13 @@ from generals.core.game import step as game_step
 
 C_PUCT = 1.5
 CHANNELS = 15
-FRAMES = 4  # past own-observation frames the net attends over (fog memory)
+FRAMES = 4  # default number of past own-observation frames the net attends over (fog memory)
 
 
-def stack_with(prev, frame):
-    """Append a frame to a (FRAMES, C, H, W) history; first call repeats the frame."""
+def stack_with(prev, frame, n=FRAMES):
+    """Append a frame to an (n, C, H, W) history; first call repeats the frame."""
     if prev is None:
-        return np.repeat(frame[None], FRAMES, 0)
+        return np.repeat(frame[None], n, 0)
     return np.concatenate([prev[1:], frame[None]])
 
 
@@ -212,7 +212,7 @@ class Net(nn.Module):
 
     def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4):
         super().__init__()
-        self.cells = h * w
+        self.cells, self.frames = h * w, frames
         self.inp = nn.Linear(CHANNELS, width)
         self.pos = nn.Parameter(torch.randn(1, 1, h * w, width) * 0.02)
         self.tpos = nn.Parameter(torch.randn(1, frames, 1, width) * 0.02)
@@ -278,7 +278,8 @@ class Searcher:
         obs = [get_observation(state, me), get_observation(state, 1 - me)]
         masks = [legal_mask(o, self.h, self.w) for o in obs]
         # ponytail: the opponent's true history is unknown to us; it starts as a repeat of its current frame.
-        stacks = [stack_with(prev, features(obs[0])), stack_with(opp_prev, features(obs[1]))]
+        n = self.net.frames
+        stacks = [stack_with(prev, features(obs[0]), n), stack_with(opp_prev, features(obs[1]), n)]
         p, v = evaluate(self.net, stacks, masks)
         return Node(state, p[0], p[1], float(v[0]), *stacks)
 
@@ -346,7 +347,7 @@ def self_play(net, h, w, sims, max_steps, key, rng, env):
         for me in (0, 1):
             obs = get_observation(state, me)
             counts = searcher.search(state, me, sims, hist[me])
-            hist[me] = stack_with(hist[me], features(obs))
+            hist[me] = stack_with(hist[me], features(obs), net.frames)
             pi = counts / counts.sum()
             temp = 1.0 if int(state.time) < 10 else 0.25
             p = pi ** (1 / temp)
@@ -387,6 +388,7 @@ def main(argv=None):
     ap.add_argument("--sims", type=int, default=32)
     ap.add_argument("--attn", choices=("dense", "pisa"), default="dense",
                     help="pisa = pyramid block-sparse attention; only pays off on large boards")
+    ap.add_argument("--frames", type=int, default=FRAMES, help="observation history length; long histories want --attn pisa")
     ap.add_argument("--size", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
@@ -401,15 +403,15 @@ def main(argv=None):
     rng = np.random.default_rng(args.seed)
     h = w = args.size
     env = GeneralsEnv(grid_dims=(h, w), truncation=args.max_steps, general_trade=True)
-    net = Net(h, w, attn=args.attn)
+    net = Net(h, w, frames=args.frames, attn=args.attn)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)
     buffer = deque(maxlen=4096)
     completed = 0
     if args.resume:
         checkpoint = torch.load(args.output, map_location="cpu", weights_only=True)
-        if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn")):
-            ap.error("resume requires matching --size, --sims, --max-steps, --seed and --attn")
+        if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn", "frames")):
+            ap.error("resume requires matching --size, --sims, --max-steps, --seed, --attn and --frames")
         net.load_state_dict(checkpoint["model"])
         opt.load_state_dict(checkpoint["optimizer"])
         rng.bit_generator.state = checkpoint["numpy_rng"]

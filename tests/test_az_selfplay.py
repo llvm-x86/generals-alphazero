@@ -147,3 +147,13 @@ def test_pisa_net_trains_and_matches_shapes():
     assert logits.shape == (2, az.num_actions(6, 6)) and torch.isfinite(logits).all()
     (logits.sum() + value.sum()).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
+
+
+def test_history_length_is_configurable_end_to_end():
+    first = az.stack_with(None, np.ones((az.CHANNELS, 6, 6), np.float32), 16)
+    assert first.shape == (16, az.CHANNELS, 6, 6)
+    nxt = az.stack_with(first, np.zeros((az.CHANNELS, 6, 6), np.float32), 16)
+    assert nxt.shape == first.shape and nxt[-1].sum() == 0 and nxt[0].sum() > 0
+    net = az.Net(6, 6, frames=16, attn="pisa", block=8, topk=2)
+    logits, value = net(torch.from_numpy(nxt[None]))
+    assert logits.shape == (1, az.num_actions(6, 6)) and torch.isfinite(value).all()
