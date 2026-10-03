@@ -35,23 +35,27 @@ pip install -e '.[alphazero]'
 
 ## AlphaZero-style research baseline
 
-`examples/az_selfplay.py` adds neural policy/value self-play with PUCT search,
-visit-count policy targets and game-outcome value targets. Start with a small
-board to verify the pipeline:
+`examples/az_selfplay.py` trains a convolutional policy/value network on PUCT
+visits and self-play. Search samples hidden terrain, enemy territory/armies and
+general position **from each player's observation and public totals**, rather
+than expanding the true hidden board. Opponent replies are resampled on each
+search visit. Start with a small smoke run:
 
 ```bash
 PYTHONPATH=. python examples/az_selfplay.py --games 1 --sims 2 --size 4 --max-steps 12 --output checkpoint.pt
+# Continue to a total of 2 games, including optimizer, replay buffer and RNG states:
+PYTHONPATH=. python examples/az_selfplay.py --games 2 --sims 2 --size 4 --max-steps 12 --output checkpoint.pt --resume
 ```
 
-This is **not** a rank-1 bot or a trained checkpoint. Search expands the
-simulator's true hidden state, while the network receives only fog-limited
-observations. It is a **perfect-information-search benchmark**, not a fair
-ranked-game agent. Ranked generals.io has fog of war
-and simultaneous moves; a deployable search must use information-set
-beliefs/determinization without reading hidden state, model opposing actions,
-and pass held-out matches against strong bots. Short runs only prove the
-training loop executes. Full-board training is computationally expensive;
-no leaderboard result is claimed.
+Real wins/losses train the value head with +1/-1. Games cut off at
+`--max-steps` use a bounded army/land **score proxy**, not a falsely labeled
+draw. The simple belief prior forgets previously sighted terrain and samples
+only four candidate boards per search; it is not an information-set solver.
+Training on 4×4 smoke boards does not produce a ranked-ready model. Evaluate
+on held-out maps and strong opponents before any live use. Checkpoints are
+saved atomically after each game; load only checkpoints you trust.
+Earlier one-off checkpoints lack optimizer/RNG state and use a different input
+shape; start a fresh run rather than using `--resume` on them.
 
 The simulator, assets, documentation and original examples come from
 [strakam/generals-bots](https://github.com/strakam/generals-bots) by Matej

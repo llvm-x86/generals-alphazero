@@ -4,29 +4,24 @@ AlphaZero-style self-play baseline for the JAX Generals.io simulator.
     python examples/az_selfplay.py --games 4 --sims 16 --size 6 --max-steps 60 --output az.pt
 
 What it is
-  * A conv policy/value network. Its input is ONLY the player's own fog-of-war
-    observation (`get_observation`), so the network never sees hidden state.
-  * PUCT tree search over one player's own actions (move cell x direction x
-    split, plus pass). Policy targets are the root visit counts.
-  * Both sides are played by the same net and searched every tick; the two
-    actions are applied simultaneously through `generals.core.game.step`.
-  * Value targets are the final outcome per player: +1 win, -1 loss, 0 for a
-    draw (truncation at --max-steps). Terminal states inside the tree use the
-    same values and are never evaluated by the network.
+  * The network sees only the player's fog-limited observation, including
+    public army/land totals. A convolutional policy/value model is trained
+    from PUCT visits and final game outcomes.
+  * Search samples hidden boards consistent with the player's observation
+    and public totals. Four independent root samples reduce dependence on a
+    single guess; opponents are sampled on every search visit.
+  * Both sides use the same network and move simultaneously.
+  * Unfinished games at --max-steps receive a bounded score-advantage proxy
+    (not a win); games ending in a general capture use +1/-1.
 
-Perfect-information benchmark (explicit simplification)
-  The search expands nodes with the *true* simulator state, so tree transitions
-  know the real hidden board, and the opponent's simultaneous action inside the
-  tree is sampled once per edge from the network's policy on the opponent's own
-  fog observation (the true state is the model). This is a perfect-info-search
-  baseline, not a fair imperfect-information agent: do not compare it with
-  fog-limited agents as if it were one. Only the network input is fog-limited.
-  Opponent sampling makes edges determinized (open-loop in the opponent), which
-  is a known approximation to simultaneous-move games.
+Belief limitation: sampled fog tiles do not preserve remembered terrain or
+past sightings; the opponent model is sampled rather than adversarial search.
+This is not a ranked-ready agent. Evaluate separately before live play.
 """
 import argparse
 import math
-import random
+import os
+from collections import deque
 
 import jax.numpy as jnp
 import jax.random as jrandom
@@ -40,7 +35,7 @@ from generals.core.action import compute_valid_move_mask_obs
 from generals.core.game import step as game_step
 
 C_PUCT = 1.5
-CHANNELS = 11
+CHANNELS = 15
 
 
 def num_actions(h, w):
@@ -63,22 +58,72 @@ def features(obs):
     planes += [np.asarray(m, dtype=np.float32) for m in (
         obs.generals, obs.castles, obs.mountains, obs.owned_cells, obs.opponent_cells, obs.fog_cells,
         obs.structures_in_fog)]
-    t = float(obs.timestep) / 500.0
-    planes.append(np.full(a.shape, t, dtype=np.float32))
-    return np.stack(planes).astype(np.float32)
+    counts = (obs.owned_land_count, obs.owned_army_count, obs.opponent_land_count, obs.opponent_army_count)
+    planes += [np.full(a.shape, np.log1p(float(v)) / 5.0, dtype=np.float32) for v in counts]
+    planes.append(np.full(a.shape, float(obs.timestep) / 500.0, dtype=np.float32))
+    return np.stack(planes)
 
 
 def legal_mask(obs, h, w):
     m = np.asarray(compute_valid_move_mask_obs(obs))  # (H, W, 4)
-    m = np.repeat(m.reshape(h * w, 4, 1), 2, axis=2).reshape(-1)  # split flag free
-    return np.concatenate([m, [True]])
+    moves = np.repeat(m.reshape(h * w, 4, 1), 2, axis=2)
+    moves[:, :, 1] &= np.asarray(obs.armies).reshape(-1, 1) > 2  # half of two equals full
+    return np.concatenate([moves.reshape(-1), [True]])
+
+
+def determinize(state, me, rng):
+    """Sample a board from one player's observation, never from hidden tiles."""
+    obs = get_observation(state, me)
+    fog = np.asarray(obs.fog_cells | obs.structures_in_fog)
+    armies = np.asarray(obs.armies).copy()
+    own = np.asarray(obs.owned_cells).copy()
+    enemy = np.asarray(obs.opponent_cells).copy()
+    hidden = np.flatnonzero(fog)
+    unseen_land = max(0, int(obs.opponent_land_count) - int(enemy.sum()))
+    # ponytail: uniform hidden-land prior; use a learned belief model once replay data justifies it.
+    chosen = rng.choice(hidden, size=min(unseen_land, len(hidden)), replace=False)
+    enemy.flat[chosen] = True
+    mountains = np.asarray(obs.mountains).copy()
+    castles = np.asarray(obs.castles).copy()
+    structures = np.asarray(obs.structures_in_fog).copy()
+    hidden_castles = (rng.random(structures.shape) < 0.2) & structures
+    hidden_castles |= structures & enemy
+    castles |= hidden_castles
+    mountains |= structures & ~hidden_castles
+    armies[hidden_castles & ~enemy] = 40
+    unseen_army = max(0, int(obs.opponent_army_count) - int((armies * enemy).sum()))
+    if len(chosen):
+        armies.flat[chosen] = rng.multinomial(unseen_army, np.full(len(chosen), 1 / len(chosen)))
+    generals = np.asarray(obs.generals).copy()
+    positions = np.asarray(state.general_positions).copy()
+    own_general = np.argwhere(generals & own)
+    enemy_general = np.argwhere(generals & enemy)
+    if len(own_general):
+        positions[me] = own_general[0]
+    if len(enemy_general):
+        positions[1 - me] = enemy_general[0]
+    elif len(chosen):
+        candidates = chosen[~structures.flat[chosen]]
+        positions[1 - me] = np.unravel_index(rng.choice(candidates if len(candidates) else chosen), own.shape)
+        generals[tuple(positions[1 - me])] = True
+    ownership = np.stack((own, enemy) if me == 0 else (enemy, own))
+    return state._replace(
+        armies=jnp.asarray(armies),
+        ownership=jnp.asarray(ownership),
+        ownership_neutral=jnp.asarray(~(own | enemy)),
+        generals=jnp.asarray(generals),
+        castles=jnp.asarray(castles),
+        mountains=jnp.asarray(mountains),
+        passable=jnp.asarray(~mountains),
+        general_positions=jnp.asarray(positions),
+    )
 
 
 class Net(nn.Module):
-    def __init__(self, h, w, width=32, blocks=2):
+    def __init__(self, h, w, width=48):
         super().__init__()
         self.inp = nn.Conv2d(CHANNELS, width, 3, padding=1)
-        self.body = nn.ModuleList([nn.Conv2d(width, width, 3, padding=1) for _ in range(blocks)])
+        self.body = nn.ModuleList([nn.Conv2d(width, width, 3, padding=d, dilation=d) for d in (1, 2, 4)])
         self.pol = nn.Conv2d(width, 8, 1)  # per cell: 4 dirs x 2 splits
         self.pass_logit = nn.Linear(width, 1)
         self.val = nn.Sequential(nn.Linear(width, 32), nn.ReLU(), nn.Linear(32, 1), nn.Tanh())
@@ -108,15 +153,21 @@ class Node:
         self.state, self.prior, self.opp_prior, self.value = state, prior, opp_prior, value
         self.n = np.zeros_like(prior)
         self.w = np.zeros_like(prior)
-        self.children = {}  # action idx -> (Node | None, terminal value | None)
+        self.children = {}  # (own action, sampled opponent action) -> child/terminal value
 
 
 def outcome(state, me, max_steps):
-    """Terminal value for `me`, or None if the game goes on. Draw = 0."""
+    """Real win/loss, or bounded score proxy when a game is truncated."""
     win = int(state.winner)
     if win >= 0:
         return 1.0 if win == me else -1.0
-    return 0.0 if int(state.time) >= max_steps else None
+    if int(state.time) < max_steps:
+        return None
+    land = np.asarray(state.ownership).sum((1, 2))
+    army = np.asarray(state.armies * state.ownership[me]).sum()
+    other_army = np.asarray(state.armies * state.ownership[1 - me]).sum()
+    return float(0.5 * np.tanh((np.log1p(army + 5 * land[me]) -
+                                np.log1p(other_army + 5 * land[1 - me])) / 3))
 
 
 class Searcher:
@@ -130,14 +181,19 @@ class Searcher:
         return Node(state, p[0], p[1], float(v[0]))
 
     def search(self, state, me, sims, noise=True):
-        root = self.make_node(state, me)
-        if noise:
-            legal = np.flatnonzero(root.prior > 0)
-            root.prior = root.prior.copy()
-            root.prior[legal] = 0.75 * root.prior[legal] + 0.25 * np.random.dirichlet([0.3] * len(legal))
-        for _ in range(sims):
-            self.simulate(root, me)
-        return root.n.copy()
+        counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
+        roots = min(4, sims)
+        for i in range(roots):
+            root = self.make_node(determinize(state, me, self.rng), me)
+            if noise:
+                legal = np.flatnonzero(root.prior > 0)
+                root.prior = root.prior.copy()
+                root.prior[legal] = 0.75 * root.prior[legal] + 0.25 * self.rng.dirichlet(
+                    np.full(len(legal), 10 / len(legal)))
+            for _ in range(i, sims, roots):
+                self.simulate(root, me)
+            counts += root.n
+        return counts
 
     def simulate(self, root, me):
         path, node = [], root
@@ -146,11 +202,13 @@ class Searcher:
             q = np.where(node.n > 0, node.w / np.maximum(node.n, 1), 0.0)
             u = q + C_PUCT * node.prior * math.sqrt(total + 1) / (1 + node.n)
             a = int(np.argmax(np.where(node.prior > 0, u, -1e9)))
+            opp_a = int(self.rng.choice(len(node.opp_prior), p=node.opp_prior / node.opp_prior.sum()))
+            edge = (a, opp_a)
             path.append((node, a))
-            if a not in node.children:
-                v = self.expand(node, a, me)
+            if edge not in node.children:
+                v = self.expand(node, edge, me)
                 break
-            child, term = node.children[a]
+            child, term = node.children[edge]
             if child is None:
                 v = term
                 break
@@ -159,17 +217,17 @@ class Searcher:
             nd.n[act] += 1
             nd.w[act] += v
 
-    def expand(self, node, a, me):
-        opp_a = int(self.rng.choice(len(node.opp_prior), p=node.opp_prior / node.opp_prior.sum()))
+    def expand(self, node, edge, me):
+        a, opp_a = edge
         acts = [None, None]
         acts[me], acts[1 - me] = decode(a, self.h, self.w), decode(opp_a, self.h, self.w)
-        state, _ = game_step(node.state, jnp.asarray(acts, dtype=jnp.int32))
+        state, _ = game_step(node.state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
         term = outcome(state, me, self.max_steps)
         if term is not None:
-            node.children[a] = (None, term)
+            node.children[edge] = (None, term)
             return term
         child = self.make_node(state, me)
-        node.children[a] = (child, None)
+        node.children[edge] = (child, None)
         return child.value
 
 
@@ -192,12 +250,13 @@ def self_play(net, h, w, sims, max_steps, key, rng, env):
             a = int(rng.choice(len(p), p=p / p.sum()))
             acts[me] = decode(a, h, w)
             rec[me].append((features(obs), pi.astype(np.float32), legal_mask(obs, h, w)))
-        state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32))
+        state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
     samples = []
     for me in (0, 1):
         z = outcome(state, me, max_steps)
         samples += [(f, pi, m, z) for f, pi, m in rec[me]]
-    return samples, ("draw" if res == 0.0 else f"player {int(state.winner)} wins")
+    result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else f"score-adjudicated {res:+.3f}"
+    return samples, result
 
 
 def train_step(net, opt, samples, epochs=2, batch=64):
@@ -224,31 +283,52 @@ def main(argv=None):
     ap.add_argument("--games", type=int, default=8)
     ap.add_argument("--sims", type=int, default=32)
     ap.add_argument("--size", type=int, default=6)
-    ap.add_argument("--max-steps", type=int, default=100)
+    ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--output", default="alphazero.pt")
+    ap.add_argument("--resume", action="store_true", help="resume from --output (trusted local checkpoint)")
     args = ap.parse_args(argv)
     if args.games < 1 or args.sims < 1 or args.size < 4 or args.max_steps < 1:
         ap.error("--games, --sims, --max-steps must be positive and --size at least 4")
 
+    torch.set_num_threads(1)
     torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    random.seed(args.seed)
     h = w = args.size
-    env = GeneralsEnv(grid_dims=(h, w), truncation=args.max_steps)
+    env = GeneralsEnv(grid_dims=(h, w), truncation=args.max_steps, general_trade=True)
     net = Net(h, w)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)
-    buffer = []
-    for g in range(args.games):
+    buffer = deque(maxlen=4096)
+    completed = 0
+    if args.resume:
+        checkpoint = torch.load(args.output, map_location="cpu", weights_only=True)
+        if any(checkpoint["args"][name] != getattr(args, name) for name in ("size", "sims", "max_steps", "seed")):
+            ap.error("resume requires matching --size, --sims, --max-steps and --seed")
+        net.load_state_dict(checkpoint["model"])
+        opt.load_state_dict(checkpoint["optimizer"])
+        rng.bit_generator.state = checkpoint["numpy_rng"]
+        torch.set_rng_state(checkpoint["torch_rng"])
+        key = jnp.asarray(checkpoint["jax_key"].numpy(), dtype=jnp.uint32)
+        buffer.extend((f.numpy(), pi.numpy(), m.numpy(), z) for f, pi, m, z in checkpoint["replay"])
+        completed = checkpoint["completed"]
+    for g in range(completed, args.games):
         key, k = jrandom.split(key)
         samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env)
-        buffer = (buffer + samples)[-20000:]
-        lp, lv = train_step(net, opt, buffer)
-        print(f"game {g + 1}/{args.games}: {result}, {len(samples)} samples, policy loss {lp:.3f}, value loss {lv:.3f}")
-    torch.save({"model": net.state_dict(), "args": vars(args)}, args.output)
-    print(f"saved checkpoint to {args.output}")
+        buffer.extend(samples)
+        indices = rng.choice(len(buffer), size=min(512, len(buffer)), replace=False)
+        lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices])
+        checkpoint = {
+            "model": net.state_dict(), "optimizer": opt.state_dict(), "args": vars(args),
+            "numpy_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+            "jax_key": torch.from_numpy(np.asarray(key).copy()), "completed": g + 1,
+            "replay": [(torch.from_numpy(f), torch.from_numpy(pi), torch.from_numpy(m), z)
+                       for f, pi, m, z in buffer],
+        }
+        torch.save(checkpoint, args.output + ".tmp")
+        os.replace(args.output + ".tmp", args.output)
+        print(f"game {g + 1}/{args.games}: {result}, {len(samples)} samples, "
+              f"policy loss {lp:.3f}, value loss {lv:.3f}; saved {args.output}", flush=True)
 
 
 if __name__ == "__main__":

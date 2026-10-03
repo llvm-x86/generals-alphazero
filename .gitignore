@@ -12,6 +12,7 @@ __pycache__/
 # Equinox model files
 *.eqx
 *.pt
+*.pt.tmp
 
 # Distribution / packaging
 .Python
