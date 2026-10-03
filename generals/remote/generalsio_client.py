@@ -1,5 +1,7 @@
 import time
 
+import jax.random as jrandom
+
 import numpy as np
 from socketio import SimpleClient  # type: ignore
 
@@ -14,13 +16,13 @@ PUBLIC_ENDPOINT = "https://ws.generals.io/"
 BOT_ENDPOINT = "https://botws.generals.io/"
 
 
-def autopilot(agent: Agent, user_id: str, lobby_id: str) -> None:
+def autopilot(agent: Agent, user_id: str, lobby_id: str, endpoint: str = BOT_ENDPOINT) -> None:
     """
     Start the autopilot for the GeneralsIO client.
     This means that agent will join the lobby and force starts,
     so he plays indefinitely.
     """
-    with GeneralsIOClient(agent, user_id) as client:
+    with GeneralsIOClient(agent, user_id, endpoint=endpoint) as client:
         while True:
             if client.status == "off":
                 client.join_private_lobby(lobby_id)
@@ -34,19 +36,20 @@ class GeneralsIOClient(SimpleClient):
     GeneralsIO lobby.
     """
 
-    def __init__(self, agent: Agent, user_id: str, public_server: bool = False):
+    def __init__(self, agent: Agent, user_id: str, endpoint: str = BOT_ENDPOINT):
         super().__init__()
-        self.public_server = public_server
+        self.endpoint = endpoint
         self.user_id = user_id
         self.agent = agent
+        self._key = jrandom.PRNGKey(int(time.time_ns() & 0xFFFFFFFF))
         self._queue_id = ""
         self._replay_id = ""
         self._status = "off"  # can be "off","game","lobby","queue"
         self._score_wins = 0
         self._score_losses = 0
-        self.bot_key = "sd09fjd203i0ejwi_changeme"
+        self.bot_key = "sd09fjdZ03i0ejwi_changeme"
 
-        self.connect(PUBLIC_ENDPOINT if public_server else BOT_ENDPOINT)
+        self.connect(endpoint)
         print("Connected to server!")
 
     @property
@@ -90,7 +93,7 @@ class GeneralsIOClient(SimpleClient):
         """
         self._status = "lobby"
         payload = (lobby_id, self.user_id, self.bot_key)
-        self._emit_receive("join_private", payload)
+        self.emit("join_private", payload)
         self._queue_id = lobby_id
         print(f"Joined private lobby {lobby_id}.")
 
@@ -100,12 +103,9 @@ class GeneralsIOClient(SimpleClient):
         :param force_start: If set to True, the Agent will set `Force Start` flag
         """
         self._status = "queue"
-        last_send_time = time.time()
+        self.emit("set_force_start", (self.queue_id, force_start))
         while True:
             event, *data = self.receive()
-            if time.time() - last_send_time > 2:
-                self.emit("set_force_start", (self.queue_id, force_start))
-                last_send_time = time.time()
             if event == "game_start":
                 self._status = "game"
                 self._initialize_game(data)
@@ -119,7 +119,7 @@ class GeneralsIOClient(SimpleClient):
         self._status = "queue"
         print("Joined queue...", end=" ", flush=True)
         payload = (self.user_id, self.bot_key)
-        self._emit_receive("join_1v1", payload)
+        self.emit("join_1v1", payload)
         while True:
             event, *data = self.receive()
             if event == "game_start":
@@ -128,13 +128,14 @@ class GeneralsIOClient(SimpleClient):
                 self._play_game()
                 break
 
-    def _initialize_game(self, data: dict) -> None:
+    def _initialize_game(self, data: tuple[dict, ...]) -> None:
         """
         Triggered after server starts the game.
         :param data: dictionary of information received in the beginning
         """
         self.game_state = GeneralsIOstate(data[0])
         self._replay_id = data[0]["replay_id"]
+        self.agent.reset()
         print("Game started!")
 
     def _generate_action(self, observation: Observation) -> tuple[int, int, int] | None:
@@ -143,7 +144,8 @@ class GeneralsIOClient(SimpleClient):
         :param action: dictionary representing the action
         If your agent passes actions correctly into our simulator, it will work here too.
         """
-        action = self.agent.act(observation)
+        self._key, action_key = jrandom.split(self._key)
+        action = self.agent.act(observation, action_key)
         pass_or_play = action[0]
         i, j = action[1], action[2]
         direction = action[3]
@@ -163,14 +165,10 @@ class GeneralsIOClient(SimpleClient):
         TODO: spawn a new thread in which Agent will calculate its moves
         """
         while True:
-            try:
-                event, data, _ = self.receive()
-            except ValueError:
-                self._finish_game(is_winner=True)
-                return
+            event, *data = self.receive()
             match event:
                 case "game_update":
-                    self.game_state.update(data)
+                    self.game_state.update(data[0])
                     obs = self.game_state.get_observation()
                     action = self._generate_action(obs)
                     if action:
@@ -188,8 +186,9 @@ class GeneralsIOClient(SimpleClient):
         status = "Won!" if is_winner else "Lost."
         self._score_wins += is_winner
         self._score_losses += not is_winner
-        prefix = "bot." if not self.public_server else ""
-        print(
-            f"You {status} Score {self._score_wins}:{self._score_losses}. Replay link: https://{prefix}generals.io/replays/{self.replay_id}"
-        )
+        print(f"You {status} Score {self._score_wins}:{self._score_losses}.")
+        if self.endpoint.rstrip("/") == BOT_ENDPOINT.rstrip("/"):
+            print(f"Replay: https://bot.generals.io/replays/{self.replay_id}")
+        elif self.endpoint.rstrip("/") == PUBLIC_ENDPOINT.rstrip("/"):
+            print(f"Replay: https://generals.io/replays/{self.replay_id}")
         self.emit("leave_game")

@@ -210,19 +210,54 @@ mask = compute_valid_move_mask(obs.armies, obs.owned_cells, obs.mountains)
 # mask shape: (H, W, 4) - True where move from (i,j) in direction d is valid
 ```
 
-## 🚀 Deployment
+## Live UI and local protocol server
 
-Deploy agents to live [generals.io](https://generals.io) servers:
+The live human site is [generals.io](https://generals.io), backed by
+`https://ws.generals.io/`. WebBridge can open the **real browser UI** under
+your existing session:
 
-```python
-from generals.remote import autopilot
-from generals.agents import ExpanderAgent
-
-agent = ExpanderAgent()
-autopilot(agent, user_id="your_user_id", lobby_id="your_lobby")
+```bash
+loom webbridge call navigate --args '{"url":"https://generals.io","newTab":true}'
 ```
 
-Register at [generals.io](https://generals.io) to get your user ID.
+The DOM board is `.game-cursor-table`; inspect visible cells/leaderboard with
+WebBridge `evaluate`. For board moves, get a cell's `getBoundingClientRect()`
+center and send CDP `Input.dispatchMouseEvent` `mousePressed` then
+`mouseReleased` at that position: synthetic DOM `click` did not move armies
+in the live tutorial, but CDP mouse events did (land increased from 1 to 2).
+PLAY on a fresh account starts the tutorial.
+The [2025 research paper](https://arxiv.org/html/2507.06825v2) reports
+thousands of matches against humans, but the current
+[official API FAQ](https://dev.generals.io/api) says bots are allowed only on
+the bot server. Public-server automation is **explicit opt-in** and may be
+disallowed or penalized. Do not put your user ID in source control:
+
+```bash
+PYTHONPATH=. python examples/client_example.py --user_id "$GENERALS_USER_ID" --lobby_id my_private_game --endpoint https://ws.generals.io/
+# Ranked queue (the example ExpanderAgent is not competitive):
+PYTHONPATH=. python examples/client_example.py --user_id "$GENERALS_USER_ID" --endpoint https://ws.generals.io/ --ranked
+```
+
+For offline private 1v1 protocol tests, run:
+
+```bash
+python -m generals.remote.local_server --host 127.0.0.1 --port 8080 --seed 0 --size 10
+PYTHONPATH=. python examples/client_example.py --user_id alice --lobby_id test --endpoint http://127.0.0.1:8080
+# In another process, use --user_id bob with the same lobby and endpoint.
+```
+
+The same `GeneralsIOClient` defaults to the bot server and accepts
+`endpoint=` for local or explicitly chosen public-server use. The local server
+speaks Socket.IO Engine.IO v4 over HTTP polling and implements private 1v1
+join, force-start, queued moves, half-army attacks, fogged `game_update`
+diffs, current simultaneous general trades, and game results. State
+transitions use the upstream JAX engine. It does **not** emulate ranked
+matchmaking, browser assets, maps/modifiers, team modes, WebSocket transport,
+or the unpublished production server's queue and RNG behavior. Full
+replacement diffs decode to the same arrays but are not byte-for-byte
+identical to production deltas. There is no captured live-match trace proving
+1:1 protocol or outcome parity. Keep this limitation explicit before using
+the local server for training or evaluation.
 
 ## 📄 Citation
 
