@@ -15,13 +15,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+alphazero = ["torch>=2.2"]
 dev = [
     "pytest>=8.0.0",
 ]
 
 [project.urls]
 Homepage = "https://generals.bot"
-Repository = "https://github.com/strakam/generals-bots"
+Repository = "https://github.com/llvm-x86/generals-alphazero"
 
 [build-system]
 requires = ["setuptools>=61.0"]

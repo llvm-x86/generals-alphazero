@@ -22,9 +22,9 @@ A high-performance JAX-based simulator for [generals.io](https://generals.io), d
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/strakam/generals-bots
-cd generals-bots
-pip install -e .
+git clone https://github.com/llvm-x86/generals-alphazero
+cd generals-alphazero
+pip install -e '.[alphazero]'
 ```
 
 > [!Note]
@@ -32,6 +32,33 @@ pip install -e .
 > The goal is to provide a fast bot development platform for reinforcement learning research.
 > The simulator follows the current rules of the game: 10,000 ranked games played in 2026 replay
 > through it with a board identical to generals.io's own engine after every turn.
+
+## AlphaZero-style research baseline
+
+`examples/az_selfplay.py` adds neural policy/value self-play with PUCT search,
+visit-count policy targets and game-outcome value targets. Start with a small
+board to verify the pipeline:
+
+```bash
+PYTHONPATH=. python examples/az_selfplay.py --games 1 --sims 2 --size 4 --max-steps 12 --output checkpoint.pt
+```
+
+This is **not** a rank-1 bot or a trained checkpoint. Search expands the
+simulator's true hidden state, while the network receives only fog-limited
+observations. It is a **perfect-information-search benchmark**, not a fair
+ranked-game agent. Ranked generals.io has fog of war
+and simultaneous moves; a deployable search must use information-set
+beliefs/determinization without reading hidden state, model opposing actions,
+and pass held-out matches against strong bots. Short runs only prove the
+training loop executes. Full-board training is computationally expensive;
+no leaderboard result is claimed.
+
+The simulator, assets, documentation and original examples come from
+[strakam/generals-bots](https://github.com/strakam/generals-bots) by Matej
+Straka, under the [MIT license](LICENSE). Its authors report tile-for-tile
+validation on [10,000 ranked replays](paper/validation/README.md); the
+AlphaZero-style trainer is an independent addition, not an official
+generals.io implementation.
 
 ## 🌱 Getting Started
 
