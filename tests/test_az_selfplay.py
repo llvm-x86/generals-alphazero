@@ -205,3 +205,19 @@ def test_hybrid_net_remembers_oldest_frame_and_trains():
     out, v = net(x)
     (out.sum() + v.sum()).backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in net.parameters())
+
+
+def test_gdn2_scan_matches_symbolic_closed_form():
+    """proofs/information_flow.py proves p_T = w sum_s lam^(T-s) v_s with lam = a(1-b) for unit k."""
+    T, dk, dv = 7, 5, 3
+    g = torch.Generator().manual_seed(4)
+    k = torch.nn.functional.normalize(torch.randn(dk, generator=g), dim=0)
+    v = torch.randn(T, dv, generator=g)
+    a, b, w = 0.9, 0.35, 0.7
+    full = lambda x, d: torch.full((1, T, 1, d), x)
+    got = az.gdn2_scan(k.expand(1, T, 1, dk), k.expand(1, T, 1, dk), v.reshape(1, T, 1, dv),
+                       full(a, dk), full(b, dk), full(w, dv))[0, :, 0]  # query = key reads p_t
+    lam = a * (1 - b)
+    for t in range(T):
+        want = w * sum(lam ** (t - s) * v[s] for s in range(t + 1))
+        assert torch.allclose(got[t], want, atol=1e-5)

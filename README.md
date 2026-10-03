@@ -92,6 +92,13 @@ convolution or output gate, and a plain PyTorch loop over frames instead of the
 chunkwise Triton kernels. The state is rebuilt from the frame window on every
 call; carrying it across turns for constant-cost search steps is not implemented.
 
+`uv run proofs/information_flow.py` runs symengine checks of the layers' information
+flow (GDN-2 memory dynamics and contractivity, softmax logit gap dense vs PISA,
+exhaustive reachability depth over layer orderings, state-size vs KV-cache
+break-even). They prove properties of the layer geometry, not that a model plays
+better; `test_gdn2_scan_matches_symbolic_closed_form` ties the GDN result to the
+shipped `gdn2_scan`.
+
 Earlier one-off checkpoints lack optimizer/RNG state and use a different input
 shape; start a fresh run rather than using `--resume` on them.
 
