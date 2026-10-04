@@ -401,3 +401,12 @@ def test_hybrid_order_validation_and_non_default_forward():
             finally:
                 az.FAST = False
             assert all((a - b).abs().max() < 1e-4 for a, b in zip(ref, out))
+
+
+def test_improved_policy_follows_q_and_keeps_prior_without_visits():
+    prior = np.array([0.5, 0.3, 0.2, 0.0])
+    n, w = np.zeros(4), np.zeros(4)
+    assert np.allclose(az.improved_policy(prior, n, w, 0.0), prior)  # no visits: the prior
+    n, w = np.array([0.0, 2.0, 0.0, 0.0]), np.array([0.0, 1.6, 0.0, 0.0])  # action 1: q = +0.8 vs root value 0
+    p = az.improved_policy(prior, n, w, 0.0)
+    assert p[1] > 0.3 and p[3] == 0 and p.sum() == pytest.approx(1, abs=1e-6)

@@ -500,11 +500,30 @@ def outcome(state, me, max_steps):
         return 1.0 if win == me else -1.0
     if int(state.time) < max_steps:
         return None
+    return score(state, me)
+
+
+def score(state, me):
+    """Bounded material advantage in (-0.5, 0.5) for `me`: log land+army ratio (also the truncation proxy)."""
     land = np.asarray(state.ownership).sum((1, 2))
     army = np.asarray(state.armies * state.ownership[me]).sum()
     other_army = np.asarray(state.armies * state.ownership[1 - me]).sum()
     return float(0.5 * np.tanh((np.log1p(army + 5 * land[me]) -
                                 np.log1p(other_army + 5 * land[1 - me])) / 3))
+
+
+C_VISIT, C_SCALE = 50, 0.3  # completed-Q scale; tune C_SCALE (Gumbel AlphaZero uses 1.0 on [0,1] values)
+
+
+def improved_policy(prior, n, w, value):
+    """Completed-Q policy target (Gumbel AlphaZero, Danihelka et al. 2022): softmax(log prior + sigma(q)),
+    unvisited actions take the root value. Improves on the prior with a handful of visits, where raw
+    visit counts only echo it."""
+    legal = prior > 0
+    q = np.where(n > 0, w / np.maximum(n, 1), value)
+    logit = np.where(legal, np.log(np.where(legal, prior, 1.0)) + (C_VISIT + n.max()) * C_SCALE * (q + 1) / 2, -np.inf)
+    p = np.exp(logit - logit.max())
+    return (p / p.sum()).astype(np.float32)
 
 
 class Searcher:
@@ -539,6 +558,7 @@ class Searcher:
         counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
         wsum = nsum = 0.0
         roots = min(4, sims)
+        target = np.zeros_like(counts)
         bel = seen = None
         if self.belief:  # own fog view + memory only
             stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
@@ -558,8 +578,10 @@ class Searcher:
             for _ in range(i, sims, roots):
                 self.simulate(root, me)
             counts += root.n
+            target += improved_policy(root.prior, root.n, root.w, root.value)
             wsum += root.w.sum()
             nsum += root.n.sum()
+        self.target = target / roots  # improved policy (training target and acting distribution)
         self.root_q = float(wsum / max(nsum, 1))  # mean backed-up value at the roots, `me` view
         return counts
 
@@ -599,7 +621,7 @@ class Searcher:
         return child.value
 
 
-def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False, lam=1.0):
+def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False, lam=1.0, shape=0.0):
     """One game; returns list of (features, pi, mask, z, enemy general cell [label only]) for both players, and result string."""
     state = env.init_state(key)
     searcher = Searcher(net, h, w, max_steps, rng, belief, incremental)
@@ -611,22 +633,22 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, increment
         acts = [None, None]
         for me in (0, 1):
             obs = get_observation(state, me)
-            counts = searcher.search(state, me, sims, hist[me], prev_st=hist_st[me])
+            searcher.search(state, me, sims, hist[me], prev_st=hist_st[me])
             hist[me] = stack_with(hist[me], features(obs, hist[me]), net.frames)
             if incremental:  # real turn: advance my recurrent state by the one new frame
                 with torch.no_grad():
                     hist_st[me] = net.step(torch.from_numpy(hist[me][-1:]), hist_st[me])[1]
-            pi = counts / counts.sum()
+            pi = searcher.target
             temp = 1.0 if int(state.time) < 10 else 0.25
             p = pi ** (1 / temp)
             a = int(rng.choice(len(p), p=p / p.sum()))
             acts[me] = decode(a, h, w)
-            rec[me].append((hist[me], pi.astype(np.float32), legal_mask(obs, h, w), int(state.general_positions[1 - me][0]) * w + int(state.general_positions[1 - me][1]), searcher.root_q))
+            rec[me].append((hist[me], pi, legal_mask(obs, h, w), int(state.general_positions[1 - me][0]) * w + int(state.general_positions[1 - me][1]), searcher.root_q, 2 * score(state, me)))
         state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
     samples = []
     for me in (0, 1):
         z = outcome(state, me, max_steps)
-        samples += [(f, pi, m, mix_target(z, q, lam), g) for f, pi, m, g, q in rec[me]]
+        samples += [(f, pi, m, mix_target((1 - shape) * z + shape * ph, q, lam), g) for f, pi, m, g, q, ph in rec[me]]
     result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else f"score-adjudicated {res:+.3f}"
     return samples, result
 
@@ -675,6 +697,11 @@ def main(argv=None):
     ap.add_argument("--value-target", choices=("outcome", "mix"), default="outcome",
                     help="mix = lambda * outcome-or-proxy + (1 - lambda) * root search value")
     ap.add_argument("--value-lambda", type=float, default=0.5, help="outcome weight for --value-target mix")
+    ap.add_argument("--shape", type=float, default=0.5,
+                    help="weight of the static material evaluation in the value target (dense signal while games truncate)")
+    ap.add_argument("--train-samples", type=int, default=2048, help="replay positions trained on after each game")
+    ap.add_argument("--train-epochs", type=int, default=4, help="passes over those positions (batch 64)")
+    ap.add_argument("--buffer", type=int, default=4096, help="replay capacity in positions")
     ap.add_argument("--incremental", action="store_true",
                     help="hybrid only: streaming net (GDN state carried across turns, search nodes store it); trains on window rebuilds")
     ap.add_argument("--fast", action="store_true", help="fused AVX-512 PISA attention at inference (needs gcc + AVX-512, else PyTorch)")
@@ -698,8 +725,8 @@ def main(argv=None):
             args.hybrid_order = check_order(args.hybrid_order or default_order(4), 4)
         except ValueError as e:
             ap.error(str(e))
-    if not 0 <= args.value_lambda <= 1:
-        ap.error("--value-lambda must be in [0, 1]")
+    if not 0 <= args.value_lambda <= 1 or not 0 <= args.shape <= 1:
+        ap.error("--value-lambda and --shape must be in [0, 1]")
 
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
@@ -709,7 +736,7 @@ def main(argv=None):
     net = Net(h, w, frames=args.frames, attn=args.attn, stream=args.incremental, order=args.hybrid_order)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)
-    buffer = deque(maxlen=4096)
+    buffer = deque(maxlen=args.buffer)
     completed = 0
     if args.resume:
         checkpoint = load_checkpoint(args.output)
@@ -726,10 +753,10 @@ def main(argv=None):
     for g in range(completed, args.games):
         key, k = jrandom.split(key)
         samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on", args.incremental,
-                                   args.value_lambda if args.value_target == "mix" else 1.0)
+                                   args.value_lambda if args.value_target == "mix" else 1.0, args.shape)
         buffer.extend(samples)
-        indices = rng.choice(len(buffer), size=min(512, len(buffer)), replace=False)
-        lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices])
+        indices = rng.choice(len(buffer), size=min(args.train_samples, len(buffer)), replace=False)
+        lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices], args.train_epochs)
         checkpoint = {
             "model": net.state_dict(), "optimizer": opt.state_dict(), "args": vars(args), "channels": CHANNELS,
             "numpy_rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
