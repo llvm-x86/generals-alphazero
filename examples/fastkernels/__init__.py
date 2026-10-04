@@ -10,9 +10,12 @@ from pathlib import Path
 
 import torch
 
+from . import emit as _emit
+
 _HERE = Path(__file__).parent
 _SRC = ["fastnet.c", "pisa_attn.c"]
-_DEPS = ["d2_nr16_u2.c"]  # #included by fastnet.c
+_DEPS = ["d2_nr16_u2.c", "pieces.c"]  # #included by fastnet.c
+EMIT = True  # use emit.py's specialised build when available
 _lib = None
 _tried = False
 
@@ -141,13 +144,19 @@ def net_forward(net, x, block, topk):
     hit = net.__dict__.get("_fk")  # (param versions, pointers, kinds, tensors kept alive)
     if hit is None or hit[0] != ver:
         hit = net.__dict__["_fk"] = (ver, *_pack(net))
-    _, arr, kinds, _keep = hit
+    _, arr, kinds_c, _keep = hit
+    kinds = list(kinds_c)
     x = x.contiguous()
     B, T, CH, h, w = x.shape
     N = h * w
     logits, value, belief = torch.empty(B, N * 8 + 1), torch.empty(B), torch.empty(B, N)
     W = net.inp.out_features
     H = net.body[0].h if hasattr(net.body, "__getitem__") and hasattr(net.body[0], "h") else net.body.layers[0].self_attn.num_heads
-    r = lib.net_forward(B, T, N, CH, W, H, len(kinds), kinds, block, topk, x.data_ptr(), ctypes.cast(arr, ctypes.c_void_p),
+    if EMIT:  # compile-time-shape build for exactly this config (emit.py); falls through to runtime-shape C
+        spec = _emit.build(_emit.EmitCfg(tuple(kinds), W, H, T, h, w, CH, block, topk))
+        if spec is not None:
+            spec.net_forward_spec(B, x.data_ptr(), ctypes.cast(arr, ctypes.c_void_p), logits.data_ptr(), value.data_ptr(), belief.data_ptr())
+            return logits, value, belief
+    r = lib.net_forward(B, T, N, CH, W, H, len(kinds), kinds_c, block, topk, x.data_ptr(), ctypes.cast(arr, ctypes.c_void_p),
                         logits.data_ptr(), value.data_ptr(), belief.data_ptr())
     return (logits, value, belief) if r == 0 else None
