@@ -374,3 +374,30 @@ def test_determinized_castle_fraction_matches_real(size):
         total += int(m.sum())
     assert total > 0
     assert abs(real - det) / total < 0.05
+
+
+def test_mix_value_target_math():
+    z, q = np.array([1.0, -1.0, 0.25]), np.array([0.2, 0.4, -0.5])
+    assert np.allclose(az.mix_target(z, q, 1.0), z)
+    assert np.allclose(az.mix_target(z, q, 0.0), q)
+    assert np.allclose(az.mix_target(z, q, 0.5), [0.6, -0.3, -0.125])
+
+
+def test_hybrid_order_validation_and_non_default_forward():
+    for bad in ("GPG", "GGGG", "PPPP", "GPGX", "gpgp"):
+        with pytest.raises(ValueError):
+            az.check_order(bad, 4)
+    assert az.default_order(4) == "GPGP"
+    net = az.Net(5, 5, frames=3, attn="hybrid", order="PGPG").eval()
+    assert [type(m).__name__ for m in net.body] == ["PisaLayer", "GdnLayer"] * 2
+    x = torch.rand(2, 3, az.CHANNELS, 5, 5)
+    with torch.no_grad():
+        ref = net(x, True)
+        assert all(torch.isfinite(t).all() for t in ref)
+        if az.fastkernels.available():
+            az.FAST = True
+            try:
+                out = net(x, True)
+            finally:
+                az.FAST = False
+            assert all((a - b).abs().max() < 1e-4 for a, b in zip(ref, out))

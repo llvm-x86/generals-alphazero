@@ -121,6 +121,14 @@ fused Triton GPU kernel, and replay storage grows linearly with `--frames`
 (16 frames at 30x30 is about 0.9 MB per sample). Dense and PISA checkpoints, and
 checkpoints with different `--frames`, are not interchangeable.
 
+Two opt-in training options (defaults unchanged): `--value-target mix` trains the
+value head on `--value-lambda` (default 0.5) times the outcome (or truncation
+score proxy) plus the remainder times the root search value (mean backed-up Q
+at the roots); the mixed target is what the replay stores, so checkpoints keep
+their format. `--hybrid-order GPGP` sets the `--attn hybrid` layer types
+(G = GDN-2, P = PISA; length 4, at least one of each; default alternates G,P).
+Both are recorded in the checkpoint and must match on `--resume`.
+
 `--attn hybrid` interleaves [Gated DeltaNet-2](https://arxiv.org/abs/2605.22791)
 layers with PISA layers (GDN-2, PISA, GDN-2, PISA). GDN-2 runs causally over the
 frame axis independently for every cell, with a fixed-size delta-rule state

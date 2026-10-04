@@ -370,6 +370,22 @@ class GdnLayer(nn.Module):
         return x + self.mlp(self.n2(x)), (S,)
 
 
+def default_order(layers):
+    return "".join("GP"[i % 2] for i in range(layers))
+
+
+def check_order(order, layers):
+    """Hybrid layer order: one char per layer, G = GDN-2, P = PISA, at least one of each."""
+    if len(order) != layers or set(order) - set("GP") or len(set(order)) < 2:
+        raise ValueError(f"hybrid order {order!r} must be {layers} chars of G/P with at least one of each")
+    return order
+
+
+def mix_target(z, q, lam):
+    """Value target: lam * outcome (or truncation proxy) + (1 - lam) * root search value."""
+    return lam * z + (1 - lam) * q
+
+
 class Net(nn.Module):
     """Pixel-level spacetime transformer: one token per cell per frame, no pooling.
 
@@ -377,7 +393,7 @@ class Net(nn.Module):
     attention can recall earlier sightings. A learned global token feeds the
     value and pass heads; the policy comes from each current-frame cell token."""
 
-    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4, stream=False):
+    def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4, stream=False, order=None):
         super().__init__()
         self.cells, self.frames, self.stream = h * w, frames, stream
         self.block, self.topk = block, topk
@@ -390,8 +406,9 @@ class Net(nn.Module):
         if attn == "pisa":
             self.body = nn.Sequential(*[PisaLayer(width, heads, block, topk) for _ in range(layers)])
         elif attn == "hybrid":  # GDN-2 (per-cell memory over frames) interleaved with PISA (space)
-            self.body = nn.Sequential(*[GdnLayer(width, heads, frames, h * w) if i % 2 == 0
-                                        else PisaLayer(width, heads, block, topk) for i in range(layers)])
+            order = check_order(order or default_order(layers), layers)
+            self.body = nn.Sequential(*[GdnLayer(width, heads, frames, h * w) if c == "G"
+                                        else PisaLayer(width, heads, block, topk) for c in order])
         else:
             layer = nn.TransformerEncoderLayer(width, heads, 4 * width, dropout=0.0, batch_first=True, norm_first=True)
             self.body = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
@@ -520,6 +537,7 @@ class Searcher:
 
     def search(self, state, me, sims, prev=None, noise=True, prev_st=None):
         counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
+        wsum = nsum = 0.0
         roots = min(4, sims)
         bel = seen = None
         if self.belief:  # own fog view + memory only
@@ -540,6 +558,9 @@ class Searcher:
             for _ in range(i, sims, roots):
                 self.simulate(root, me)
             counts += root.n
+            wsum += root.w.sum()
+            nsum += root.n.sum()
+        self.root_q = float(wsum / max(nsum, 1))  # mean backed-up value at the roots, `me` view
         return counts
 
     def simulate(self, root, me):
@@ -578,7 +599,7 @@ class Searcher:
         return child.value
 
 
-def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False):
+def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False, lam=1.0):
     """One game; returns list of (features, pi, mask, z, enemy general cell [label only]) for both players, and result string."""
     state = env.init_state(key)
     searcher = Searcher(net, h, w, max_steps, rng, belief, incremental)
@@ -600,12 +621,12 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, increment
             p = pi ** (1 / temp)
             a = int(rng.choice(len(p), p=p / p.sum()))
             acts[me] = decode(a, h, w)
-            rec[me].append((hist[me], pi.astype(np.float32), legal_mask(obs, h, w), int(state.general_positions[1 - me][0]) * w + int(state.general_positions[1 - me][1])))
+            rec[me].append((hist[me], pi.astype(np.float32), legal_mask(obs, h, w), int(state.general_positions[1 - me][0]) * w + int(state.general_positions[1 - me][1]), searcher.root_q))
         state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
     samples = []
     for me in (0, 1):
         z = outcome(state, me, max_steps)
-        samples += [(f, pi, m, z, g) for f, pi, m, g in rec[me]]
+        samples += [(f, pi, m, mix_target(z, q, lam), g) for f, pi, m, g, q in rec[me]]
     result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else f"score-adjudicated {res:+.3f}"
     return samples, result
 
@@ -649,6 +670,11 @@ def main(argv=None):
                     help="pisa = pyramid block-sparse attention; hybrid = GDN-2 over time + PISA over space")
     ap.add_argument("--frames", type=int, default=FRAMES, help="observation history length; long histories want --attn pisa")
     ap.add_argument("--belief", choices=("off", "on"), default="off", help="sample enemy general/land from the net's belief head")
+    ap.add_argument("--hybrid-order", default=None, metavar="GPGP",
+                    help="hybrid only: layer types, one char per layer (G = GDN-2, P = PISA); default alternates G,P")
+    ap.add_argument("--value-target", choices=("outcome", "mix"), default="outcome",
+                    help="mix = lambda * outcome-or-proxy + (1 - lambda) * root search value")
+    ap.add_argument("--value-lambda", type=float, default=0.5, help="outcome weight for --value-target mix")
     ap.add_argument("--incremental", action="store_true",
                     help="hybrid only: streaming net (GDN state carried across turns, search nodes store it); trains on window rebuilds")
     ap.add_argument("--fast", action="store_true", help="fused AVX-512 PISA attention at inference (needs gcc + AVX-512, else PyTorch)")
@@ -663,20 +689,31 @@ def main(argv=None):
     if args.incremental and args.attn != "hybrid":
         ap.error("--incremental needs --attn hybrid")
 
+    if args.hybrid_order is not None and args.attn != "hybrid":
+        ap.error("--hybrid-order needs --attn hybrid")
+    if args.attn == "hybrid":
+        try:
+            args.hybrid_order = check_order(args.hybrid_order or default_order(4), 4)
+        except ValueError as e:
+            ap.error(str(e))
+    if not 0 <= args.value_lambda <= 1:
+        ap.error("--value-lambda must be in [0, 1]")
+
     torch.set_num_threads(1)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     h = w = args.size
     env = make_env(h, args.max_steps)
-    net = Net(h, w, frames=args.frames, attn=args.attn, stream=args.incremental)
+    net = Net(h, w, frames=args.frames, attn=args.attn, stream=args.incremental, order=args.hybrid_order)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     key = jrandom.PRNGKey(args.seed)
     buffer = deque(maxlen=4096)
     completed = 0
     if args.resume:
         checkpoint = load_checkpoint(args.output)
-        if any(checkpoint["args"].get(name, False) != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn", "frames", "incremental")):
-            ap.error("resume requires matching --size, --sims, --max-steps, --seed, --attn, --frames and --incremental")
+        old = {"hybrid_order": default_order(4) if args.attn == "hybrid" else None, "value_target": "outcome", "value_lambda": 0.5, **checkpoint["args"]}
+        if any(old.get(name, False) != getattr(args, name) for name in ("size", "sims", "max_steps", "seed", "attn", "frames", "incremental", "hybrid_order", "value_target", "value_lambda")):
+            ap.error("resume requires matching --size, --sims, --max-steps, --seed, --attn, --frames, --incremental, --hybrid-order, --value-target and --value-lambda")
         net.load_state_dict(checkpoint["model"])
         opt.load_state_dict(checkpoint["optimizer"])
         rng.bit_generator.state = checkpoint["numpy_rng"]
@@ -686,7 +723,8 @@ def main(argv=None):
         completed = checkpoint["completed"]
     for g in range(completed, args.games):
         key, k = jrandom.split(key)
-        samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on", args.incremental)
+        samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on", args.incremental,
+                                   args.value_lambda if args.value_target == "mix" else 1.0)
         buffer.extend(samples)
         indices = rng.choice(len(buffer), size=min(512, len(buffer)), replace=False)
         lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices])
