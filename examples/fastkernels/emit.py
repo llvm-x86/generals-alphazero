@@ -84,17 +84,25 @@ def _gemm(M, N, K, act, res):
     tail = (1 << (N - nf)) - 1
     a = f"A_{('NONE', 'RELU', 'GELU')[act]}"
     body = [f"static void {name}(const float *A, const float *B, const float *bias, float *C) {{"]
-    # row-outer keeps the 8 x K A-panel in L1 while B streams (d2's rule when B fits in cache)
+    # d2's loop-order rule: row-outer (8 x K A-panel stays in L1, B streams) when B fits in cache, else column-outer
+    rowout = K * N <= 65536
     for j0, j1, mk in [(0, nf, "0xFFFF"), (nf, N, f"0x{tail:X}")]:
         if j0 == j1:
             continue
-        body.append(f"    for (int j = {j0}; j < {j1}; j += 16) {{")
+        calls = []
         if M >= 8:
-            body.append(f"        for (int i = 0; i + 8 <= {M}; i += 8)")
-            body.append(f"            tile_(8, {K}, A + (size_t)i * {K}, B + j, {N}, {mk}, bias + j, {a}, {res}, C + (size_t)i * {N} + j, {N});")
+            calls.append((f"for (int i = 0; i + 8 <= {M}; i += 8)", 8, "i"))
         if rt:
-            body.append(f"        tile_({rt}, {K}, A + (size_t){M - rt} * {K}, B + j, {N}, {mk}, bias + j, {a}, {res}, C + (size_t){M - rt} * {N} + j, {N});")
-        body.append("    }")
+            calls.append(("", rt, str(M - rt)))
+        if rowout:
+            for loop, R, i in calls:
+                body.append(f"    {loop} for (int j = {j0}; j < {j1}; j += 16)")
+                body.append(f"        tile_({R}, {K}, A + (size_t){i} * {K}, B + j, {N}, {mk}, bias + j, {a}, {res}, C + (size_t){i} * {N} + j, {N});")
+        else:
+            body.append(f"    for (int j = {j0}; j < {j1}; j += 16) {{")
+            for loop, R, i in calls:
+                body.append(f"        {loop} tile_({R}, {K}, A + (size_t){i} * {K}, B + j, {N}, {mk}, bias + j, {a}, {res}, C + (size_t){i} * {N} + j, {N});")
+            body.append("    }")
     body.append("}")
     return name, "\n".join(body)
 
