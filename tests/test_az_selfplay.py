@@ -410,3 +410,11 @@ def test_improved_policy_follows_q_and_keeps_prior_without_visits():
     n, w = np.array([0.0, 2.0, 0.0, 0.0]), np.array([0.0, 1.6, 0.0, 0.0])  # action 1: q = +0.8 vs root value 0
     p = az.improved_policy(prior, n, w, 0.0)
     assert p[1] > 0.3 and p[3] == 0 and p.sum() == pytest.approx(1, abs=1e-6)
+
+
+def test_self_play_vs_scripted_opponent_records_only_the_net_side():
+    from generals.agents import ExpanderAgent
+    net = az.Net(h=5, w=5, width=16, layers=2, heads=2, frames=2, attn="dense").eval()
+    env = az.make_env(5, 20)
+    samples, _ = az.self_play(net, 5, 5, 2, 6, jr.PRNGKey(0), np.random.default_rng(0), env, opp=ExpanderAgent())
+    assert len(samples) == 6  # one side only (a full self-play game records 12)

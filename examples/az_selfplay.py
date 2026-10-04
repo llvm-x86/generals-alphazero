@@ -30,6 +30,7 @@ from collections import deque
 import jax.numpy as jnp
 import jax.random as jrandom
 import numpy as np
+from generals.agents import ExpanderAgent
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -621,11 +622,12 @@ class Searcher:
         return child.value
 
 
-def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False, lam=1.0, shape=0.0):
-    """One game; returns list of (features, pi, mask, z, enemy general cell [label only]) for both players, and result string."""
+def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, incremental=False, lam=1.0, shape=0.0, opp=None):
+    """One game (`opp`: scripted agent on a random side, whose moves are not recorded); returns list of (features, pi, mask, z, enemy general cell [label only]) for both players, and result string."""
     state = env.init_state(key)
     searcher = Searcher(net, h, w, max_steps, rng, belief, incremental)
     rec, hist, hist_st = [[], []], [None, None], [None, None]
+    scripted = int(rng.integers(2)) if opp is not None else -1
     while True:
         res = outcome(state, 0, max_steps)
         if res is not None:
@@ -633,6 +635,10 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, increment
         acts = [None, None]
         for me in (0, 1):
             obs = get_observation(state, me)
+            if me == scripted:
+                key, k2 = jrandom.split(key)
+                acts[me] = opp.act(obs, k2)
+                continue
             searcher.search(state, me, sims, hist[me], prev_st=hist_st[me])
             hist[me] = stack_with(hist[me], features(obs, hist[me]), net.frames)
             if incremental:  # real turn: advance my recurrent state by the one new frame
@@ -647,6 +653,8 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, increment
         state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
     samples = []
     for me in (0, 1):
+        if me == scripted:
+            continue
         z = outcome(state, me, max_steps)
         samples += [(f, pi, m, mix_target((1 - shape) * z + shape * ph, q, lam), g) for f, pi, m, g, q, ph in rec[me]]
     result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else f"score-adjudicated {res:+.3f}"
@@ -699,6 +707,8 @@ def main(argv=None):
     ap.add_argument("--value-lambda", type=float, default=0.5, help="outcome weight for --value-target mix")
     ap.add_argument("--shape", type=float, default=0.5,
                     help="weight of the static material evaluation in the value target (dense signal while games truncate)")
+    ap.add_argument("--opp-frac", type=float, default=0.5,
+                    help="fraction of games vs the scripted Expander (real win/loss targets while self-play is all draws)")
     ap.add_argument("--train-samples", type=int, default=2048, help="replay positions trained on after each game")
     ap.add_argument("--train-epochs", type=int, default=4, help="passes over those positions (batch 64)")
     ap.add_argument("--buffer", type=int, default=4096, help="replay capacity in positions")
@@ -753,7 +763,8 @@ def main(argv=None):
     for g in range(completed, args.games):
         key, k = jrandom.split(key)
         samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on", args.incremental,
-                                   args.value_lambda if args.value_target == "mix" else 1.0, args.shape)
+                                   args.value_lambda if args.value_target == "mix" else 1.0, args.shape,
+                                   ExpanderAgent() if rng.random() < args.opp_frac else None)
         buffer.extend(samples)
         indices = rng.choice(len(buffer), size=min(args.train_samples, len(buffer)), replace=False)
         lp, lv = train_step(net, opt, [buffer[int(i)] for i in indices], args.train_epochs)
