@@ -707,7 +707,7 @@ def main(argv=None):
     ap.add_argument("--value-lambda", type=float, default=0.5, help="outcome weight for --value-target mix")
     ap.add_argument("--shape", type=float, default=0.5,
                     help="weight of the static material evaluation in the value target (dense signal while games truncate)")
-    ap.add_argument("--opp-frac", type=float, default=0.5,
+    ap.add_argument("--opp-frac", type=float, default=0.0,
                     help="fraction of games vs the scripted Expander (real win/loss targets while self-play is all draws)")
     ap.add_argument("--train-samples", type=int, default=2048, help="replay positions trained on after each game")
     ap.add_argument("--train-epochs", type=int, default=4, help="passes over those positions (batch 64)")
