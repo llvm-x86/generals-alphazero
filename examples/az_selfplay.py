@@ -684,6 +684,8 @@ def main(argv=None):
     ap.add_argument("--output", default="alphazero.pt")
     ap.add_argument("--resume", action="store_true", help="resume from --output (trusted local checkpoint)")
     args = ap.parse_args(argv)
+    global FAST
+    FAST = args.fast and fastkernels.available()
     if args.games < 1 or args.sims < 1 or args.size < 4 or args.max_steps < 1:
         ap.error("--games, --sims, --max-steps must be positive and --size at least 4")
     if args.incremental and args.attn != "hybrid":
