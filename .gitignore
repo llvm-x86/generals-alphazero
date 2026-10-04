@@ -183,3 +183,4 @@ uv.lock
 competition/
 tests/test_matchup.py
 paper/validation/replays/
+examples/fastkernels/.cache/

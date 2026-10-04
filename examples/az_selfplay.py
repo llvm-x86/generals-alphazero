@@ -24,6 +24,7 @@ This is not a ranked-ready agent. Evaluate separately before live play.
 import argparse
 import math
 import os
+import sys
 from collections import deque
 
 import jax.numpy as jnp
@@ -33,11 +34,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from generals import GeneralsEnv, get_observation
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fastkernels  # noqa: E402
+from generals import GeneralsEnv, get_observation  # noqa: E402
 from generals.core.action import compute_valid_move_mask_obs
 from generals.core.game import step as game_step
 
 C_PUCT = 1.5
+FAST = False  # --fast: fused AVX-512 PISA attention in no-grad inference (examples/fastkernels), PyTorch otherwise
 CHANNELS = 20  # 15 current-view planes + 5 memory planes (see features)
 BELIEF_WEIGHT = 0.1  # auxiliary enemy-general cross-entropy weight in train_step
 FRAMES = 4  # default number of past own-observation frames the net attends over (fog memory)
@@ -239,6 +243,12 @@ class PisaLayer(nn.Module):
         with torch.no_grad():
             sel = self.select(q * d ** -0.5, k, valid, P)  # (B, N, S) leaf-block ids
         S = sel.shape[-1]
+        if FAST and not torch.is_grad_enabled():
+            nk = k.shape[2] - pad
+            if k.stride() == v.stride() and kg.stride() == vg.stride():
+                out = fastkernels.sparse_attn(q, k[:, :, :nk], v[:, :, :nk], kg, vg, sel, C)
+                if out is not None:
+                    return out
         idx = sel.reshape(B, 1, N * S, 1, 1).expand(B, H, -1, C, d)
         ks = k.reshape(B, H, P, C, d).gather(2, idx).reshape(B, H, N, S * C, d)
         vs = v.reshape(B, H, P, C, d).gather(2, idx).reshape(B, H, N, S * C, d)
@@ -259,21 +269,30 @@ class PisaLayer(nn.Module):
             cnts.append(cnts[-1].reshape(-1, 2).sum(1))
         means = [None] + [s / c.clamp(min=1)[:, None] for s, c in zip(sums[1:], cnts[1:])]
 
+        def fast_lse(qq, X, ok, A, G):  # fused gather+LSE (no-grad inference with --fast), else None
+            return fastkernels.group_lse(qq, X, ok, A, G) if FAST and not torch.is_grad_enabled() else None
+
         def top(A, u):  # keep the K best-scoring candidates
             return A.gather(-1, u.topk(K, -1).indices)
 
         A = torch.zeros(B, N, 1, dtype=torch.long)
         for lvl in range(len(sums) - 1, 1, -1):  # coarsest level down to 2
             if A.shape[-1] > K:
-                ch = torch.stack([2 * A, 2 * A + 1], -1)  # children at level lvl-1: (B, N, a, 2)
-                g = means[lvl - 1].gather(2, ch.reshape(B, 1, -1, 1).expand(B, H, -1, d)).reshape(B, H, N, -1, 2, d)
-                lg = torch.einsum("bhnd,bhnasd->bhnas", q, g).masked_fill(~(cnts[lvl - 1][ch] > 0)[:, None], -torch.inf)
-                A = top(A, torch.logsumexp(lg, -1).sum(1))
+                u = fast_lse(q, means[lvl - 1], cnts[lvl - 1] > 0, A, 2)  # children at level lvl-1 of each a
+                if u is None:
+                    ch = torch.stack([2 * A, 2 * A + 1], -1)  # (B, N, a, 2)
+                    g = means[lvl - 1].gather(2, ch.reshape(B, 1, -1, 1).expand(B, H, -1, d)).reshape(B, H, N, -1, 2, d)
+                    lg = torch.einsum("bhnd,bhnasd->bhnas", q, g).masked_fill(~(cnts[lvl - 1][ch] > 0)[:, None], -torch.inf)
+                    u = torch.logsumexp(lg, -1).sum(1)
+                A = top(A, u)
             A = torch.stack([2 * A, 2 * A + 1], -1).flatten(-2)
         if A.shape[-1] > K:  # leaf blocks: exact LSE over their original keys
-            g = k.reshape(B, H, P, C, d).gather(2, A.reshape(B, 1, -1, 1, 1).expand(B, H, -1, C, d)).reshape(B, H, N, -1, C, d)
-            lg = torch.einsum("bhnd,bhnacd->bhnac", q, g).masked_fill(~valid.reshape(P, C)[A][:, None], -torch.inf)
-            A = top(A, torch.logsumexp(lg, -1).sum(1))
+            u = fast_lse(q, k, valid, A, C)
+            if u is None:
+                g = k.reshape(B, H, P, C, d).gather(2, A.reshape(B, 1, -1, 1, 1).expand(B, H, -1, C, d)).reshape(B, H, N, -1, C, d)
+                lg = torch.einsum("bhnd,bhnacd->bhnac", q, g).masked_fill(~valid.reshape(P, C)[A][:, None], -torch.inf)
+                u = torch.logsumexp(lg, -1).sum(1)
+            A = top(A, u)
         return A
 
 
@@ -361,6 +380,7 @@ class Net(nn.Module):
     def __init__(self, h, w, width=64, layers=4, heads=4, frames=FRAMES, attn="dense", block=16, topk=4, stream=False):
         super().__init__()
         self.cells, self.frames, self.stream = h * w, frames, stream
+        self.block, self.topk = block, topk
         if stream and attn != "hybrid":
             raise ValueError("stream (incremental) mode needs attn='hybrid'")
         self.inp = nn.Linear(CHANNELS, width)
@@ -386,6 +406,10 @@ class Net(nn.Module):
 
         stream=True: the window is folded frame by frame from an empty state (== `step` applied to
         every frame), which is the same function the incremental path carries across turns."""
+        if FAST and not self.stream and not torch.is_grad_enabled():  # whole forward as one C call
+            r = fastkernels.net_forward(self, x, self.block, self.topk)
+            if r is not None:
+                return r if with_belief else r[:2]
         if self.stream:
             state = None
             for t in range(x.shape[1] - 1):
@@ -627,6 +651,7 @@ def main(argv=None):
     ap.add_argument("--belief", choices=("off", "on"), default="off", help="sample enemy general/land from the net's belief head")
     ap.add_argument("--incremental", action="store_true",
                     help="hybrid only: streaming net (GDN state carried across turns, search nodes store it); trains on window rebuilds")
+    ap.add_argument("--fast", action="store_true", help="fused AVX-512 PISA attention at inference (needs gcc + AVX-512, else PyTorch)")
     ap.add_argument("--size", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)

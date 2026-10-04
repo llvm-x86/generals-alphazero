@@ -81,6 +81,15 @@ clean label) from both seats' histories, split by game, then `az_selfplay.py --r
 held-out teacher-action accuracy 0.317 (Expander samples its move, so accuracy is capped); policy-argmax vs Random,
 100 games: 14 W / 13 L / 73 D (Expander itself: 74/2/24) -- the 90% bar was NOT met.
 
+BC diagnosis (6x6, seeds 5000.. validation / 9000.. test, train maps 100000+, 100 side-swapped games each): the 150-step
+limit is the first bottleneck -- Expander vs Random is 75/1/24 at 150 steps but 98/2/0 at 300 and 500. Second, Expander's
+move is a score-proportional *sample* (about uniform over owned->owned moves when nothing can be captured), so labels are
+noise (held-out accuracy 0.31) and the policy's argmax is a much weaker agent than the sampler: the BC student shuffles
+armies (39% of its moves reverse the previous one vs 16% for Expander; it holds 4-20 cells vs 14-26). Deterministic
+labels (`--teacher argmax`) are learnable (accuracy 0.80) but that teacher is itself weak (32% wins at 150, 64% at 300).
+No variant reached the 90% bar; best was a *sampled* policy from a 300-step sampled-teacher net (test 49 W / 15 L / 36 D).
+`--dagger-rounds N` relabels student-visited states with the teacher.
+
 Expander does not hunt the general: on 8x8 at `--max-steps 200` roughly 44% of its games vs Random
 are truncated draws, so use a longer limit when you want real captures.
 
