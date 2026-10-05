@@ -50,7 +50,12 @@ class Ckpt:
         a = ck["args"]
         if a["size"] != size:
             raise SystemExit(f"checkpoint was trained for --size {a['size']}, not {size}")
-        self.net = az.Net(size, size, frames=a["frames"], attn=a["attn"], stream=a.get("incremental", False))
+        if a.get("max_steps", max_steps) != max_steps:
+            print(f"note: checkpoint trained with --max-steps {a['max_steps']}, evaluating at {max_steps}")
+        # search/value settings the checkpoint was trained with (module globals: one ckpt's settings per process)
+        az.HEUR, az.TRUNC = a.get("heur", 0.0), a.get("truncation", "proxy")
+        self.net = az.Net(size, size, frames=a["frames"], attn=a["attn"], stream=a.get("incremental", False),
+                          order=a.get("hybrid_order"))
         self.net.load_state_dict(ck["model"])
         self.net.eval()
         self.sims, self.size = sims, size

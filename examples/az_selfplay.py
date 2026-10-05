@@ -102,7 +102,7 @@ def legal_mask(obs, h, w):
     m = np.asarray(compute_valid_move_mask_obs(obs))  # (H, W, 4)
     moves = np.repeat(m.reshape(h * w, 4, 1), 2, axis=2)
     moves[:, :, 1] &= np.asarray(obs.armies).reshape(-1, 1) > 2  # half of two equals full
-    return np.concatenate([moves.reshape(-1), [not moves.any()]])  # pass only when stuck: otherwise it just wastes a turn
+    return np.concatenate([moves.reshape(-1), [True]])  # waiting is a real action (garrison, income timing)
 
 
 def make_env(size, max_steps):
@@ -495,13 +495,16 @@ class Node:
 
 
 def outcome(state, me, max_steps):
-    """Real win/loss, or bounded score proxy when a game is truncated."""
+    """Real win/loss; at the time limit a draw (0) by default, or the bounded material proxy with --truncation proxy."""
     win = int(state.winner)
     if win >= 0:
         return 1.0 if win == me else -1.0
     if int(state.time) < max_steps:
         return None
-    return score(state, me)
+    return score(state, me) if TRUNC == "proxy" else 0.0
+
+
+TRUNC = "draw"  # --truncation
 
 
 def score(state, me):
@@ -513,7 +516,7 @@ def score(state, me):
                                 np.log1p(other_army + 5 * land[1 - me])) / 3))
 
 
-HEUR = 0.5  # weight of the static material evaluation in search leaf values (--heur)
+HEUR = 0.0  # weight of the static material evaluation in search leaf values (--heur)
 
 
 def leaf_value(v, state, me):
@@ -583,13 +586,14 @@ class Searcher:
             root = self.make_node(determinize(state, me, self.rng, bel, seen), me, prev, None, prev_st)
             if noise:
                 legal = np.flatnonzero(root.prior > 0)
+                root.clean = root.prior
                 root.prior = root.prior.copy()
                 root.prior[legal] = 0.75 * root.prior[legal] + 0.25 * self.rng.dirichlet(
                     np.full(len(legal), 10 / len(legal)))
             for _ in range(i, sims, roots):
                 self.simulate(root, me)
             counts += root.n
-            target += improved_policy(root.prior, root.n, root.w, root.value)
+            target += improved_policy(getattr(root, "clean", root.prior), root.n, root.w, root.value)  # exploration noise steers visits only, never the label
             wsum += root.w.sum()
             nsum += root.n.sum()
         self.target = target / roots  # improved policy (training target and acting distribution)
@@ -677,6 +681,8 @@ def train_step(net, opt, samples, epochs=2, batch=64):
     m = torch.from_numpy(np.stack([s[2] for s in samples]))
     z = torch.tensor([s[3] for s in samples], dtype=torch.float32)
     gen = torch.tensor([s[4] for s in samples])
+    tot = np.zeros(2)
+    nb = 0
     for _ in range(epochs):
         perm = torch.randperm(len(x))
         for i in range(0, len(x), batch):
@@ -691,7 +697,9 @@ def train_step(net, opt, samples, epochs=2, batch=64):
             opt.zero_grad()
             (loss_p + loss_v + BELIEF_WEIGHT * loss_b).backward()
             opt.step()
-    return loss_p.item(), loss_v.item()
+            tot += (loss_p.item(), loss_v.item())
+            nb += 1
+    return tuple(tot / nb)  # mean over every minibatch of the call
 
 
 def load_checkpoint(path):
@@ -715,9 +723,11 @@ def main(argv=None):
     ap.add_argument("--value-target", choices=("outcome", "mix"), default="outcome",
                     help="mix = lambda * outcome-or-proxy + (1 - lambda) * root search value")
     ap.add_argument("--value-lambda", type=float, default=0.5, help="outcome weight for --value-target mix")
-    ap.add_argument("--shape", type=float, default=0.5,
+    ap.add_argument("--shape", type=float, default=0.0,
                     help="weight of the static material evaluation in the value target (dense signal while games truncate)")
-    ap.add_argument("--heur", type=float, default=0.5, help="weight of the static material score in search leaf values")
+    ap.add_argument("--truncation", choices=("draw", "proxy"), default="draw",
+                    help="value at the time limit: draw (0) or the material proxy (not a real win)")
+    ap.add_argument("--heur", type=float, default=0.0, help="weight of the static material score in search leaf values")
     ap.add_argument("--opp-frac", type=float, default=0.0,
                     help="fraction of games vs the scripted Expander (real win/loss targets while self-play is all draws)")
     ap.add_argument("--train-samples", type=int, default=2048, help="replay positions trained on after each game")
@@ -732,8 +742,8 @@ def main(argv=None):
     ap.add_argument("--output", default="alphazero.pt")
     ap.add_argument("--resume", action="store_true", help="resume from --output (trusted local checkpoint)")
     args = ap.parse_args(argv)
-    global FAST, HEUR
-    HEUR = args.heur
+    global FAST, HEUR, TRUNC
+    HEUR, TRUNC = args.heur, args.truncation
     FAST = args.fast and fastkernels.available()
     if args.games < 1 or args.sims < 1 or args.size < 4 or args.max_steps < 1:
         ap.error("--games, --sims, --max-steps must be positive and --size at least 4")

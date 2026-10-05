@@ -4,6 +4,7 @@ import pathlib
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
+import torch
 import pytest
 
 from generals.core import game
@@ -117,7 +118,8 @@ def test_incompatible_checkpoint_rejected(tmp_path):
         az.main(["--games", "2", "--sims", "1", "--size", "4", "--max-steps", "3", "--output", str(out), "--resume"])
 
 
-def test_truncation_is_score_proxy_not_draw():
+def test_truncation_is_score_proxy_not_draw(monkeypatch):
+    monkeypatch.setattr(az, "TRUNC", "proxy")
     grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[4, 4].set(2)
     state = game.create_initial_state(grid)
     state = state._replace(armies=state.armies.at[0, 0].set(40), time=jnp.int32(3))
@@ -419,3 +421,19 @@ def test_self_play_vs_scripted_opponent_records_only_the_net_side():
     env = az.make_env(5, 20)
     samples, _ = az.self_play(net, 5, 5, 2, 6, jr.PRNGKey(0), np.random.default_rng(0), env, opp=ExpanderAgent())
     assert len(samples) == 6  # one side only (a full self-play game records 12)
+
+
+def test_pass_is_always_legal_and_truncation_is_a_draw_by_default():
+    env = az.make_env(6, 5)
+    state = env.init_state(jr.PRNGKey(0))
+    assert az.legal_mask(az.get_observation(state, 0), 6, 6)[-1]  # a move exists AND pass is legal
+    assert az.TRUNC == "draw" and az.outcome(state._replace(time=jnp.int32(5)), 0, 5) == 0.0
+
+
+def test_train_step_reports_mean_over_all_minibatches():
+    net = az.Net(h=4, w=4, width=16, layers=2, heads=2, frames=2, attn="dense")
+    x = np.zeros((6, 2, az.CHANNELS, 4, 4), np.float32)
+    pi = np.full(129, 1 / 129, np.float32)
+    s = [(x[i], pi, np.ones(129, bool), 0.0, 0) for i in range(6)]
+    lp, lv = az.train_step(net, torch.optim.SGD(net.parameters(), lr=0.0), s, epochs=2, batch=2)
+    assert abs(lp - np.log(129)) < 0.5 and lv < 1  # lr 0: every minibatch has the init loss, mean equals it
