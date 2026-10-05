@@ -15,6 +15,12 @@ def test_wilson_known_values():
     lo, hi = ev.wilson(50, 100)
     assert (lo, hi) == pytest.approx((0.4038, 0.5962), abs=1e-3)
 
+def test_paired_score_uses_complete_maps_and_draws():
+    real, adj, pairs = ev.run("random", "random", 5, 3, 2, 0, return_pairs=True)
+    assert real.sum() == adj.sum() == 3
+    assert pairs == [0.5]  # at 2 turns no general capture; third game is an incomplete map pair
+    assert ev.paired_interval([0.0, 0.5, 1.0]) == pytest.approx((1 / 6, 5 / 6), abs=0.2)
+
 
 def test_run_counts_and_ckpt_paths(tmp_path):
     real, adj = ev.run("expander", "random", 6, 4, 30, 0)

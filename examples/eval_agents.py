@@ -8,7 +8,8 @@ Agents: random, expander, hunter, harvester, ckpt:<path> (az_selfplay checkpoint
 current source's Gumbel-root/PUCT-interior search with --sims N: a standardized engine applied to the checkpoint's
 weights and recorded heur/truncation, not necessarily the original actor; legacy pre-schema checkpoints load eval-only). Game i uses map seed+i//2 and puts A in seat i%2, so each map is
 played from both seats. A truncated game counts as a draw; a second table adjudicates draws by the
-sign of az_selfplay.score (material proxy, not a real win). Intervals are Wilson 95%.
+sign of az_selfplay.score (material proxy, not a real win). Intervals are Wilson 95% for game counts and
+bootstrap 95% over paired maps for match score (win=1, draw=0.5, loss=0).
 """
 import argparse
 import importlib.util
@@ -118,10 +119,11 @@ def play(env, agents, state, key, max_steps):
     return win, float(az.score(state, 0))  # real material proxy, only consulted for draws
 
 
-def run(name_a, name_b, size, games, max_steps, seed, sims=0, belief=False):
+def run(name_a, name_b, size, games, max_steps, seed, sims=0, belief=False, return_pairs=False):
     env = az.make_env(size, max_steps)
     a, b = make_agent(name_a, sims, max_steps, size, belief), make_agent(name_b, sims, max_steps, size, belief)
     real, adj = np.zeros(3, int), np.zeros(3, int)  # A's [wins, losses, draws]
+    pairs = []
     for g in range(games):
         a_seat = g % 2
         state = env.init_state(jrandom.PRNGKey(seed + g // 2))
@@ -134,7 +136,20 @@ def run(name_a, name_b, size, games, max_steps, seed, sims=0, belief=False):
             real[2] += 1
             s = proxy if a_seat == 0 else -proxy
             adj[0 if s > 0 else 1 if s < 0 else 2] += 1
-    return real, adj
+        points = 0.5 if win < 0 else float(win == a_seat)
+        if g % 2:
+            pairs.append((first_seat + points) / 2)
+        else:
+            first_seat = points
+    return (real, adj, pairs) if return_pairs else (real, adj)
+
+
+def paired_interval(scores, reps=5000):
+    """Percentile bootstrap over MAP pairs, not independent seats. Seed fixed so reports reproduce."""
+    scores = np.asarray(scores, dtype=np.float64)
+    rng = np.random.default_rng(0)
+    means = rng.choice(scores, size=(reps, len(scores)), replace=True).mean(1)
+    return float(np.quantile(means, 0.025)), float(np.quantile(means, 0.975))
 
 
 def report(title, name_a, name_b, counts, games):
@@ -158,11 +173,18 @@ def main(argv=None):
     if args.games < 1 or args.size < 4 or args.max_steps < 1 or args.sims < 0:
         ap.error("need --games >= 1, --size >= 4, --max-steps >= 1, --sims >= 0")
     torch.set_num_threads(1)
-    real, adj = run(args.agent_a, args.agent_b, args.size, args.games, args.max_steps, args.seed, args.sims, args.belief)
+    real, adj, pairs = run(args.agent_a, args.agent_b, args.size, args.games, args.max_steps, args.seed, args.sims, args.belief, True)
     print(f"{args.agent_a} (A) vs {args.agent_b} (B): {args.games} games on {args.size}x{args.size}, "
           f"max_steps {args.max_steps}, seeds {args.seed}..{args.seed + (args.games - 1) // 2}, sims {args.sims}")
     report("real outcomes (truncation = draw)", args.agent_a, args.agent_b, real, args.games)
     report("draws adjudicated by material proxy (sign of az_selfplay.score; NOT real wins)", args.agent_a, args.agent_b, adj, args.games)
+    if pairs:
+        lo, hi = paired_interval(pairs)
+        print(f"paired map score (W=1,D=0.5,L=0): {np.mean(pairs):.3f}, bootstrap95 [{lo:.3f}, {hi:.3f}] "
+              f"over {len(pairs)} complete two-seat maps"
+              + (f"; {args.games % 2} unpaired game excluded" if args.games % 2 else ""))
+    else:
+        print("paired map score: unavailable (fewer than two games)")
     return real, adj
 
 
