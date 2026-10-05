@@ -43,7 +43,7 @@ class Builtin:
 
 
 class Ckpt:
-    """az_selfplay checkpoint. sims=0: argmax of the masked policy; sims>0: most-visited PUCT root action."""
+    """az_selfplay checkpoint. sims=0: argmax of the masked policy; sims>0: Gumbel root search, best survivor."""
 
     def __init__(self, path, sims, max_steps, size, belief=False):
         ck = az.load_checkpoint(path)
@@ -69,8 +69,8 @@ class Ckpt:
     def act(self, state, me, key):
         obs = get_observation(state, me)
         if self.sims:
-            counts = self.searcher.search(state, me, self.sims, self.hist, noise=False)
-            a = int(np.argmax(counts))
+            self.searcher.search(state, me, self.sims, self.hist, noise=False)
+            a = self.searcher.best
         else:
             mask = az.legal_mask(obs, self.size, self.size)
             stack = az.stack_with(self.hist, az.features(obs, self.hist), self.net.frames)

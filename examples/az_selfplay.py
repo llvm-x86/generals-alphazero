@@ -526,15 +526,24 @@ def leaf_value(v, state, me):
     return (1 - HEUR) * v + HEUR * 2 * score(state, me) if HEUR else v
 
 
-C_VISIT, C_SCALE = 50, 0.3  # completed-Q scale; tune C_SCALE (Gumbel AlphaZero uses 1.0 on [0,1] values)
+C_VISIT, C_SCALE = 50, 1.0  # Gumbel AlphaZero sigma(q) = (C_VISIT + max visits) * C_SCALE * q, q in [0, 1]
+MAX_CAND = 16  # root candidates drawn by Gumbel-top-k
+
+
+def mixed_q(prior, n, w, value):
+    """Completed Q (Danihelka et al. 2022, eq. 33): visited actions use their mean backup; the rest take
+    v_mix, the root value interpolated with the prior-weighted mean of the visited q."""
+    vis = n > 0
+    q = np.where(vis, w / np.maximum(n, 1), 0.0)
+    tot = n.sum()
+    vmix = value if tot == 0 else (value + tot * (prior[vis] * q[vis]).sum() / prior[vis].sum()) / (1 + tot)
+    return np.where(vis, q, vmix)
 
 
 def improved_policy(prior, n, w, value):
-    """Completed-Q policy target (Gumbel AlphaZero, Danihelka et al. 2022): softmax(log prior + sigma(q)),
-    unvisited actions take the root value. Improves on the prior with a handful of visits, where raw
-    visit counts only echo it."""
+    """softmax(log prior + sigma(completed q)) over legal (prior > 0) actions; the prior when nothing is visited."""
     legal = prior > 0
-    q = np.where(n > 0, w / np.maximum(n, 1), value)
+    q = mixed_q(prior, n, w, value)
     logit = np.where(legal, np.log(np.where(legal, prior, 1.0)) + (C_VISIT + n.max()) * C_SCALE * (q + 1) / 2, -np.inf)
     p = np.exp(logit - logit.max())
     return (p / p.sum()).astype(np.float32)
@@ -569,10 +578,10 @@ class Searcher:
         return Node(state, p[0], p[1], leaf_value(float(v[0]), state, me), *stacks, st)
 
     def search(self, state, me, sims, prev=None, noise=True, prev_st=None):
-        counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
-        wsum = nsum = 0.0
-        roots = min(4, sims)
-        target = np.zeros_like(counts)
+        """Gumbel root search: draw up to MAX_CAND legal candidates by Gumbel-top-k, spend `sims` with sequential
+        halving, round-robin over a few determinized roots whose statistics are pooled. Sets `target` (improved
+        policy, the training label), `best` (Gumbel-max action over the survivors, the action to play) and `root_q`.
+        noise=False drops the Gumbel draw (evaluation)."""
         bel = seen = None
         if self.belief:  # own fog view + memory only
             stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
@@ -582,31 +591,56 @@ class Searcher:
                 else:
                     logits = self.net(torch.from_numpy(stack[None]), True)[2][0]
             bel, seen = F.softmax(logits, 0).numpy(), stack[-1, 15] > 0.5
-        for i in range(roots):
-            root = self.make_node(determinize(state, me, self.rng, bel, seen), me, prev, None, prev_st)
-            if noise:
-                legal = np.flatnonzero(root.prior > 0)
-                root.clean = root.prior
-                root.prior = root.prior.copy()
-                root.prior[legal] = 0.75 * root.prior[legal] + 0.25 * self.rng.dirichlet(
-                    np.full(len(legal), 10 / len(legal)))
-            for _ in range(i, sims, roots):
-                self.simulate(root, me)
-            counts += root.n
-            target += improved_policy(getattr(root, "clean", root.prior), root.n, root.w, root.value)  # exploration noise steers visits only, never the label
-            wsum += root.w.sum()
-            nsum += root.n.sum()
-        self.target = target / roots  # improved policy (training target and acting distribution)
-        self.root_q = float(wsum / max(nsum, 1))  # mean backed-up value at the roots, `me` view
-        return counts
+        roots = [self.make_node(determinize(state, me, self.rng, bel, seen), me, prev, None, prev_st)
+                 for _ in range(min(4, sims))]
+        mask = legal_mask(get_observation(state, me), self.h, self.w)
+        prior = np.where(mask, np.maximum(roots[0].prior, 1e-12), 0.0)  # the net sees only my observation: identical across roots
+        value = float(np.mean([r.value for r in roots]))
+        legal = np.flatnonzero(mask)
+        logp = np.log(np.where(mask, prior, 1.0))
+        g = self.rng.gumbel(size=len(prior)) if noise else np.zeros(len(prior))
+        cand = legal[np.argsort(-(g + logp)[legal])[:min(len(legal), MAX_CAND, sims)]]
+        n, w = np.zeros(len(prior)), np.zeros(len(prior))
 
-    def simulate(self, root, me):
+        def visit(a):
+            r = roots[int(n[a]) % len(roots)]
+            self.simulate(r, me, a)
+            n[a] += 1
+            w[a] += self._last
+
+        def score_of(idx):
+            q = mixed_q(prior, n, w, value)[idx]
+            return g[idx] + logp[idx] + (C_VISIT + n.max()) * C_SCALE * (q + 1) / 2
+
+        phases = max(1, math.ceil(math.log2(len(cand)))) if len(cand) > 1 else 1
+        used = 0
+        while len(cand) > 1 and used < sims:
+            per = max(1, sims // (phases * len(cand)))
+            for a in cand:
+                for _ in range(per):
+                    if used < sims:
+                        visit(a)
+                        used += 1
+            cand = cand[np.argsort(-score_of(cand))[:max(1, len(cand) // 2)]]
+        while used < sims:  # leftover budget goes to the survivor
+            visit(cand[0])
+            used += 1
+        self.best = int(cand[np.argmax(score_of(cand))])
+        self.target = improved_policy(prior, n, w, value)
+        self.root_q = float((self.target * mixed_q(prior, n, w, value)).sum())  # `me` view
+        return n.astype(np.float32)
+
+    def simulate(self, root, me, first=None):
+        """One simulation from `root`; `first` forces the root action. Leaf value lands in self._last."""
         path, node = [], root
         while True:
-            total = node.n.sum()
-            q = np.where(node.n > 0, node.w / np.maximum(node.n, 1), 0.0)
-            u = q + C_PUCT * node.prior * math.sqrt(total + 1) / (1 + node.n)
-            a = int(np.argmax(np.where(node.prior > 0, u, -1e9)))
+            if first is not None and node is root:
+                a = first
+            else:
+                total = node.n.sum()
+                q = np.where(node.n > 0, node.w / np.maximum(node.n, 1), 0.0)
+                u = q + C_PUCT * node.prior * math.sqrt(total + 1) / (1 + node.n)
+                a = int(np.argmax(np.where(node.prior > 0, u, -1e9)))
             opp_a = int(self.rng.choice(len(node.opp_prior), p=node.opp_prior / node.opp_prior.sum()))
             edge = (a, opp_a)
             path.append((node, a))
@@ -621,6 +655,7 @@ class Searcher:
         for nd, act in reversed(path):  # outcome stays from `me` view; no sign flip (simultaneous moves)
             nd.n[act] += 1
             nd.w[act] += v
+        self._last = v
 
     def expand(self, node, edge, me):
         a, opp_a = edge
@@ -659,9 +694,7 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, increment
                 with torch.no_grad():
                     hist_st[me] = net.step(torch.from_numpy(hist[me][-1:]), hist_st[me])[1]
             pi = searcher.target
-            temp = 1.0 if int(state.time) < 10 else 0.25
-            p = pi ** (1 / temp)
-            a = int(rng.choice(len(p), p=p / p.sum()))
+            a = searcher.best  # Gumbel-max over the sequential-halving survivors: samples the improved policy
             acts[me] = decode(a, h, w)
             rec[me].append((hist[me], pi, legal_mask(obs, h, w), int(state.general_positions[1 - me][0]) * w + int(state.general_positions[1 - me][1]), searcher.root_q, 2 * score(state, me)))
         state, _ = game_step(state, jnp.asarray(acts, dtype=jnp.int32), general_trade=True)
@@ -733,6 +766,7 @@ def main(argv=None):
     ap.add_argument("--train-samples", type=int, default=2048, help="replay positions trained on after each game")
     ap.add_argument("--train-epochs", type=int, default=4, help="passes over those positions (batch 64)")
     ap.add_argument("--buffer", type=int, default=4096, help="replay capacity in positions")
+    ap.add_argument("--snapshot-every", type=int, default=0, help="also save weights-only <output>.g<N> every N games (and .g0)")
     ap.add_argument("--incremental", action="store_true",
                     help="hybrid only: streaming net (GDN state carried across turns, search nodes store it); trains on window rebuilds")
     ap.add_argument("--fast", action="store_true", help="fused AVX-512 PISA attention at inference (needs gcc + AVX-512, else PyTorch)")
@@ -782,6 +816,12 @@ def main(argv=None):
         key = jnp.asarray(checkpoint["jax_key"].numpy(), dtype=jnp.uint32)
         buffer.extend((f.numpy(), pi.numpy(), m.numpy(), z, g) for f, pi, m, z, g in checkpoint["replay"])
         completed = checkpoint["completed"]
+    def snapshot(n):  # weights only, loadable by eval_agents (ckpt:<path>)
+        if args.snapshot_every:
+            torch.save({"model": net.state_dict(), "args": vars(args), "channels": CHANNELS}, f"{args.output}.g{n}")
+
+    if completed == 0:
+        snapshot(0)  # untrained baseline: improvement is measured against this
     for g in range(completed, args.games):
         key, k = jrandom.split(key)
         samples, result = self_play(net, h, w, args.sims, args.max_steps, k, rng, env, args.belief == "on", args.incremental,
@@ -797,6 +837,8 @@ def main(argv=None):
             "replay": [(torch.from_numpy(f), torch.from_numpy(pi), torch.from_numpy(m), z, g)
                        for f, pi, m, z, g in buffer],
         }
+        if args.snapshot_every and (g + 1) % args.snapshot_every == 0:
+            snapshot(g + 1)
         torch.save(checkpoint, args.output + ".tmp")
         os.replace(args.output + ".tmp", args.output)
         print(f"game {g + 1}/{args.games}: {result}, {len(samples)} samples, "

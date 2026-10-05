@@ -437,3 +437,18 @@ def test_train_step_reports_mean_over_all_minibatches():
     s = [(x[i], pi, np.ones(129, bool), 0.0, 0) for i in range(6)]
     lp, lv = az.train_step(net, torch.optim.SGD(net.parameters(), lr=0.0), s, epochs=2, batch=2)
     assert abs(lp - np.log(129)) < 0.5 and lv < 1  # lr 0: every minibatch has the init loss, mean equals it
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_search_finds_forced_capture_that_prior_ignores(seed):
+    """Tactical gate: capturing the adjacent general wins now (full or half stack). At 32 sims search must put
+    >0.9 of its target on those moves, and play one, whatever the untrained prior thinks."""
+    grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[0, 1].set(2)
+    state = game.create_initial_state(grid)
+    state = state._replace(armies=state.armies.at[0, 0].set(10).at[0, 1].set(1))
+    torch.manual_seed(seed)
+    net = az.Net(h=5, w=5, width=16, layers=2, heads=2, frames=2, attn="dense").eval()
+    s = az.Searcher(net, 5, 5, 50, np.random.default_rng(seed))
+    s.search(state, 0, 32)
+    wins = [6, 7]  # cell 0, RIGHT, full / half
+    assert s.target[wins].sum() > 0.9 and s.best in wins
