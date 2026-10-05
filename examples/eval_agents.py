@@ -54,6 +54,7 @@ class Ckpt:
             print(f"note: checkpoint trained with --max-steps {a['max_steps']}, evaluating at {max_steps}")
         # search/value settings the checkpoint was trained with (module globals: one ckpt's settings per process)
         az.HEUR, az.TRUNC = a.get("heur", 0.0), a.get("truncation", "proxy")
+        az.FAST = az.fastkernels.available()  # matches torch to ~3e-7 (tests/test_fastkernels.py)
         self.net = az.Net(size, size, frames=a["frames"], attn=a["attn"], stream=a.get("incremental", False),
                           order=a.get("hybrid_order"))
         self.net.load_state_dict(ck["model"])

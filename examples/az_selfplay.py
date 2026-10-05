@@ -582,15 +582,16 @@ class Searcher:
         halving, round-robin over a few determinized roots whose statistics are pooled. Sets `target` (improved
         policy, the training label), `best` (Gumbel-max action over the survivors, the action to play) and `root_q`.
         noise=False drops the Gumbel draw (evaluation)."""
-        bel = seen = None
+        stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
+        seen = stack[-1, 15] > 0.5  # ever-seen cells: the enemy general cannot sit on one it was not seen on
+        bel = np.ones(self.h * self.w)  # uniform over never-seen hidden cells unless the belief head says otherwise
         if self.belief:  # own fog view + memory only
-            stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
             with torch.no_grad():
                 if self.incremental:
                     logits = self.net.step(torch.from_numpy(stack[-1:]), prev_st, True)[0][2][0]
                 else:
                     logits = self.net(torch.from_numpy(stack[None]), True)[2][0]
-            bel, seen = F.softmax(logits, 0).numpy(), stack[-1, 15] > 0.5
+            bel = F.softmax(logits, 0).numpy()
         roots = [self.make_node(determinize(state, me, self.rng, bel, seen), me, prev, None, prev_st)
                  for _ in range(min(4, sims))]
         mask = legal_mask(get_observation(state, me), self.h, self.w)
@@ -704,7 +705,7 @@ def self_play(net, h, w, sims, max_steps, key, rng, env, belief=False, increment
             continue
         z = outcome(state, me, max_steps)
         samples += [(f, pi, m, mix_target((1 - shape) * z + shape * ph, q, lam), g) for f, pi, m, g, q, ph in rec[me]]
-    result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else f"score-adjudicated {res:+.3f}"
+    result = f"player {int(state.winner)} wins" if int(state.winner) >= 0 else (f"score-adjudicated {res:+.3f}" if TRUNC == "proxy" else "draw (time limit)")
     return samples, result
 
 

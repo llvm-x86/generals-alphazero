@@ -452,3 +452,22 @@ def test_search_finds_forced_capture_that_prior_ignores(seed):
     s.search(state, 0, 32)
     wins = [6, 7]  # cell 0, RIGHT, full / half
     assert s.target[wins].sum() > 0.9 and s.best in wins
+
+
+def test_search_determinization_respects_memory_without_belief_head():
+    """Belief head off: the sampled enemy general still avoids ever-seen cells (memory plane 15)."""
+    env = az.make_env(6, 50)
+    state = env.init_state(jr.PRNGKey(3))
+    obs = az.get_observation(state, 0)
+    feat = az.features(obs)
+    seen = feat[15] > 0.5
+    net = az.Net(h=6, w=6, width=16, layers=2, heads=2, frames=2, attn="dense").eval()
+    s = az.Searcher(net, 6, 6, 50, np.random.default_rng(0))
+    orig = az.determinize
+    got = []
+    az.determinize = lambda *a, **k: (got.append(a[4] if len(a) > 4 else k.get("seen")), orig(*a, **k))[1]
+    try:
+        s.search(state, 0, 4)
+    finally:
+        az.determinize = orig
+    assert got and all(g is not None and (g == seen).all() for g in got)
