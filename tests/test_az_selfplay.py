@@ -300,7 +300,8 @@ def test_incremental_state_outlives_the_window():
     assert torch.allclose(_step_all(net, x[:, -3:], False)[0], rebuilt[0], atol=1e-4)  # same once the history fits
 
 
-def test_incremental_search_child_costs_one_step_and_trains(tmp_path):
+def test_incremental_search_child_costs_one_step_and_trains(tmp_path, monkeypatch):
+    monkeypatch.setattr(az, "HEUR", 0)  # compare raw net values
     net = _stream_net(4)
     state = az.make_env(6, 20).init_state(jr.PRNGKey(0))
     s = az.Searcher(net, 6, 6, 20, np.random.default_rng(0), incremental=True)

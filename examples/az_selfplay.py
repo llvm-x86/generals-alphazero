@@ -102,7 +102,7 @@ def legal_mask(obs, h, w):
     m = np.asarray(compute_valid_move_mask_obs(obs))  # (H, W, 4)
     moves = np.repeat(m.reshape(h * w, 4, 1), 2, axis=2)
     moves[:, :, 1] &= np.asarray(obs.armies).reshape(-1, 1) > 2  # half of two equals full
-    return np.concatenate([moves.reshape(-1), [True]])
+    return np.concatenate([moves.reshape(-1), [not moves.any()]])  # pass only when stuck: otherwise it just wastes a turn
 
 
 def make_env(size, max_steps):
@@ -513,6 +513,16 @@ def score(state, me):
                                 np.log1p(other_army + 5 * land[1 - me])) / 3))
 
 
+HEUR = 0.5  # weight of the static material evaluation in search leaf values (--heur)
+
+
+def leaf_value(v, state, me):
+    """Net value blended with the material score. Untrained, the value head is noise, so search sees no
+    difference between moves and its policy target stays at the prior; the static score is a real (if crude)
+    lookahead signal that bootstraps the policy until the net's own value takes over (lower --heur then)."""
+    return (1 - HEUR) * v + HEUR * 2 * score(state, me) if HEUR else v
+
+
 C_VISIT, C_SCALE = 50, 0.3  # completed-Q scale; tune C_SCALE (Gumbel AlphaZero uses 1.0 on [0,1] values)
 
 
@@ -543,7 +553,7 @@ class Searcher:
         stacks = [stack_with(prev, features(obs[0], prev), n), stack_with(opp_prev, features(obs[1], opp_prev), n)]
         if not self.incremental:
             p, v = evaluate(self.net, stacks, masks)
-            return Node(state, p[0], p[1], float(v[0]), *stacks)
+            return Node(state, p[0], p[1], leaf_value(float(v[0]), state, me), *stacks)
         fr = torch.from_numpy(np.stack([s[-1] for s in stacks]))
         with torch.no_grad():
             if opp_prev is None:  # root: two independent batch-1 steps, then batch
@@ -553,7 +563,7 @@ class Searcher:
             else:
                 (logits, v), st = self.net.step(fr, st)
         p, v = priors(logits, v, masks)
-        return Node(state, p[0], p[1], float(v[0]), *stacks, st)
+        return Node(state, p[0], p[1], leaf_value(float(v[0]), state, me), *stacks, st)
 
     def search(self, state, me, sims, prev=None, noise=True, prev_st=None):
         counts = np.zeros(num_actions(self.h, self.w), dtype=np.float32)
@@ -707,6 +717,7 @@ def main(argv=None):
     ap.add_argument("--value-lambda", type=float, default=0.5, help="outcome weight for --value-target mix")
     ap.add_argument("--shape", type=float, default=0.5,
                     help="weight of the static material evaluation in the value target (dense signal while games truncate)")
+    ap.add_argument("--heur", type=float, default=0.5, help="weight of the static material score in search leaf values")
     ap.add_argument("--opp-frac", type=float, default=0.0,
                     help="fraction of games vs the scripted Expander (real win/loss targets while self-play is all draws)")
     ap.add_argument("--train-samples", type=int, default=2048, help="replay positions trained on after each game")
@@ -721,7 +732,8 @@ def main(argv=None):
     ap.add_argument("--output", default="alphazero.pt")
     ap.add_argument("--resume", action="store_true", help="resume from --output (trusted local checkpoint)")
     args = ap.parse_args(argv)
-    global FAST
+    global FAST, HEUR
+    HEUR = args.heur
     FAST = args.fast and fastkernels.available()
     if args.games < 1 or args.sims < 1 or args.size < 4 or args.max_steps < 1:
         ap.error("--games, --sims, --max-steps must be positive and --size at least 4")
