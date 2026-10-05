@@ -1,4 +1,5 @@
 import importlib.util
+import types
 import pathlib
 
 import jax.numpy as jnp
@@ -53,12 +54,11 @@ def test_search_cannot_read_hidden_general_position():
     visits = [az.Searcher(net, 8, 8, 12, np.random.default_rng(5)).search(s, 0, 8, noise=False)
               for s in (first, second)]
     assert np.array_equal(*visits)
-    on = [az.Searcher(net, 8, 8, 12, np.random.default_rng(5), belief=True).search(s, 0, 8, noise=False)
+    on = [az.Searcher(net, 8, 8, 12, np.random.default_rng(5), az.SearchCfg(belief=True)).search(s, 0, 8, noise=False)
           for s in (first, second)]
     assert np.array_equal(*on)
     bel = np.random.default_rng(0).random(64)
-    seen = np.zeros((8, 8), bool)
-    guessed = [az.determinize(s, 0, np.random.default_rng(3), bel, seen) for s in (first, second)]
+    guessed = [az.determinize(s, 0, np.random.default_rng(3), bel) for s in (first, second)]
     for field in ("armies", "ownership", "generals", "general_positions", "passable"):
         assert np.array_equal(getattr(guessed[0], field), getattr(guessed[1], field))
 
@@ -100,7 +100,7 @@ def test_belief_is_masked_and_determinize_places_general_from_it():
     state = game.create_initial_state(grid)
     point = np.zeros(36)
     point[3 * 6 + 4] = 1  # all belief mass on (3, 4)
-    sample = az.determinize(state, 0, np.random.default_rng(0), point, np.zeros((6, 6), bool))
+    sample = az.determinize(state, 0, np.random.default_rng(0), point)
     assert tuple(np.asarray(sample.general_positions[1])) == (3, 4)
     assert bool(sample.ownership[1][3, 4])
 
@@ -118,13 +118,13 @@ def test_incompatible_checkpoint_rejected(tmp_path):
         az.main(["--games", "2", "--sims", "1", "--size", "4", "--max-steps", "3", "--output", str(out), "--resume"])
 
 
-def test_truncation_is_score_proxy_not_draw(monkeypatch):
-    monkeypatch.setattr(az, "TRUNC", "proxy")
+def test_truncation_is_score_proxy_not_draw():
     grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[4, 4].set(2)
     state = game.create_initial_state(grid)
     state = state._replace(armies=state.armies.at[0, 0].set(40), time=jnp.int32(3))
-    assert 0 < az.outcome(state, 0, 3) < 0.5
-    assert az.outcome(state, 1, 3) == pytest.approx(-az.outcome(state, 0, 3))
+    assert az.outcome(state, 0, 3) == 0.0  # default: draw
+    assert 0 < az.outcome(state, 0, 3, "proxy") < 0.5
+    assert az.outcome(state, 1, 3, "proxy") == pytest.approx(-az.outcome(state, 0, 3, "proxy"))
 
 
 def test_opponent_reply_resampled_each_visit():
@@ -302,11 +302,10 @@ def test_incremental_state_outlives_the_window():
     assert torch.allclose(_step_all(net, x[:, -3:], False)[0], rebuilt[0], atol=1e-4)  # same once the history fits
 
 
-def test_incremental_search_child_costs_one_step_and_trains(tmp_path, monkeypatch):
-    monkeypatch.setattr(az, "HEUR", 0)  # compare raw net values
+def test_incremental_search_child_costs_one_step_and_trains(tmp_path):
     net = _stream_net(4)
     state = az.make_env(6, 20).init_state(jr.PRNGKey(0))
-    s = az.Searcher(net, 6, 6, 20, np.random.default_rng(0), incremental=True)
+    s = az.Searcher(net, 6, 6, 20, np.random.default_rng(0), az.SearchCfg(incremental=True))
     root = s.make_node(state, 0)
     assert root.st is not None
     s.simulate(root, 0)
@@ -427,16 +426,115 @@ def test_pass_is_always_legal_and_truncation_is_a_draw_by_default():
     env = az.make_env(6, 5)
     state = env.init_state(jr.PRNGKey(0))
     assert az.legal_mask(az.get_observation(state, 0), 6, 6)[-1]  # a move exists AND pass is legal
-    assert az.TRUNC == "draw" and az.outcome(state._replace(time=jnp.int32(5)), 0, 5) == 0.0
+    assert az.SearchCfg().truncation == "draw" and az.outcome(state._replace(time=jnp.int32(5)), 0, 5) == 0.0
 
 
-def test_train_step_reports_mean_over_all_minibatches():
+def _sample(i, pi, z, term="capture", n=4, frames=2):
+    m = np.ones(n * n * 8 + 1, bool)
+    f = np.random.default_rng(i).random((frames, az.CHANNELS, n, n)).astype(np.float32)
+    f[:, 19] = 0  # general never sighted: belief label is trained on
+    return az.Sample(f, pi.astype(np.float32), m, z, int(i % (n * n)), 0, i, 0, z if term == "capture" else 0.0, term, 0.0, 0.0, 0.0)
+
+
+def test_train_metrics_are_sample_weighted_and_match_a_direct_oracle():
+    """Heterogeneous targets, a partial final minibatch (6 samples, batch 4) and lr 0: the reported online loss and the
+    pre/post fit must equal the per-sample weighted means computed directly; mean-of-batch-means would differ."""
+    torch.manual_seed(0)
     net = az.Net(h=4, w=4, width=16, layers=2, heads=2, frames=2, attn="dense")
-    x = np.zeros((6, 2, az.CHANNELS, 4, 4), np.float32)
-    pi = np.full(129, 1 / 129, np.float32)
-    s = [(x[i], pi, np.ones(129, bool), 0.0, 0) for i in range(6)]
-    lp, lv = az.train_step(net, torch.optim.SGD(net.parameters(), lr=0.0), s, epochs=2, batch=2)
-    assert abs(lp - np.log(129)) < 0.5 and lv < 1  # lr 0: every minibatch has the init loss, mean equals it
+    rng = np.random.default_rng(1)
+    A = 129
+    samples = []
+    for i in range(6):
+        pi = np.zeros(A)
+        pi[rng.choice(A, 2 + 3 * i, replace=False)] = 1
+        samples.append(_sample(i, pi / pi.sum(), [1.0, -1.0, 0.0, 0.0, 1.0, 0.0][i], "capture" if i in (0, 1, 4) else "time_limit"))
+    with torch.no_grad():
+        x = torch.from_numpy(np.stack([s.f for s in samples]))
+        logits, v, bel = net(x, True)
+        pi_t = torch.from_numpy(np.stack([s.pi for s in samples]))
+        ce = -(pi_t * torch.log_softmax(logits, 1)).sum(1)
+        ent = -(pi_t * pi_t.clamp_min(1e-12).log()).sum(1)
+        z = torch.tensor([s.z for s in samples])
+        se = (v - z) ** 2
+    out = az.train_step(net, torch.optim.SGD(net.parameters(), lr=0.0), samples, epochs=1, batch=4)
+    for stats in (out["pre"], out["post"]):
+        assert stats["n"] == 6 and stats["n_capture"] == 3 and stats["n_time_limit"] == 3
+        assert stats["ce"] == pytest.approx(ce.mean().item(), rel=1e-4) and stats["entropy"] == pytest.approx(ent.mean().item(), rel=1e-4)
+        assert stats["kl"] == pytest.approx((ce - ent).mean().item(), rel=1e-3, abs=1e-5)
+        assert stats["v_mse"] == pytest.approx(se.mean().item(), rel=1e-4)
+        assert stats["v_mse_capture"] == pytest.approx(se[[0, 1, 4]].mean().item(), rel=1e-4)
+        assert stats["v_mse_time_limit"] == pytest.approx(se[[2, 3, 5]].mean().item(), rel=1e-4)
+        assert stats["v_base_zero"] == pytest.approx((z ** 2).mean().item()) and stats["v_base_mean"] == pytest.approx(z.var(unbiased=False).item())
+    assert out["online"]["policy"] == pytest.approx(ce.mean().item(), rel=1e-4)  # weights 4/6 and 2/6, not 1/2 and 1/2
+    batch_means = (ce[:4].mean() + ce[4:].mean()) / 2
+    assert abs(batch_means.item() - ce.mean().item()) > 1e-3  # the data really distinguishes the two aggregations
+    assert out["online"]["value"] == pytest.approx(se.mean().item(), rel=1e-4) and out["updates"] == 2
+
+
+def test_training_reduces_the_probe_fit():
+    torch.manual_seed(0)
+    net = az.Net(h=4, w=4, width=16, layers=2, heads=2, frames=2, attn="dense")
+    pi = np.zeros(129)
+    pi[[3, 7]] = 0.5
+    samples = [_sample(i, pi, 1.0) for i in range(8)]
+    out = az.train_step(net, torch.optim.Adam(net.parameters(), lr=3e-3), samples, epochs=30, batch=4)
+    assert out["post"]["kl"] < out["pre"]["kl"] * 0.5 and out["post"]["v_mse"] < out["pre"]["v_mse"]
+
+
+def _tiny(tmp_path, name="c.pt", extra=(), games="1"):
+    out = tmp_path / name
+    az.main(["--games", games, "--sims", "2", "--size", "4", "--max-steps", "4", "--seed", "3", "--output", str(out), *extra])
+    return out
+
+
+def test_checkpoint_and_replay_carry_schema_outcome_and_episode_ids(tmp_path):
+    out = _tiny(tmp_path, games="2", extra=["--snapshot-every", "1"])
+    ck = az.load_checkpoint(out, resume=True)
+    assert ck["schema"] == az.SCHEMA and ck["semantics"]["truncation"] == "draw" and ck["code"]["sha256"]
+    assert ck["semantics"]["objective"] == "finite-horizon-4/draw/shape=0.0/heur=0.0"
+    reps = [az.Sample.load(d) for d in ck["replay"]]
+    assert {r.ep for r in reps} == {0, 1}  # one episode id per game
+    assert all(r.term == "time_limit" and r.raw == 0.0 and r.z == 0.0 for r in reps)  # draw objective, raw outcome kept
+    assert all(r.me in (0, 1) and 0 <= r.t < 4 for r in reps)
+    snap = torch.load(f"{out}.g1", weights_only=True)  # snapshots keep their own immutable identity
+    assert snap["semantics"] == ck["semantics"] and snap["code"] == ck["code"] and snap["args"]["sims"] == 2 and "optimizer" not in snap
+
+
+def test_self_play_records_raw_capture_outcome_separately_from_the_trained_target():
+    grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[0, 1].set(2)
+    state = game.create_initial_state(grid)
+    state = state._replace(armies=state.armies.at[0, 0].set(10).at[0, 1].set(1))
+
+    class Env:
+        def init_state(self, key):
+            return state
+
+    net = az.Net(h=5, w=5, width=16, layers=2, heads=2, frames=2, attn="dense").eval()
+    samples, result = az.self_play(net, 5, 5, 4, 10, jr.PRNGKey(0), np.random.default_rng(0), Env(), shape=0.5, episode=7)
+    assert result.startswith("player") and {s.ep for s in samples} == {7} and all(s.term == "capture" for s in samples)
+    winner = int(result.split()[1])
+    for s in samples:
+        assert s.raw == (1.0 if s.me == winner else -1.0)
+        assert s.z == pytest.approx(0.5 * s.raw + 0.5 * s.ph)  # trained target mixes shape; raw stays untouched
+
+
+def test_legacy_checkpoints_are_eval_only_and_changed_semantics_cannot_resume(tmp_path):
+    out = _tiny(tmp_path)
+    ck = torch.load(out, weights_only=True)
+    for key in ("schema", "semantics", "code", "code_lineage"):
+        del ck[key]
+    legacy = tmp_path / "legacy.pt"
+    torch.save(ck, legacy)
+    assert az.load_checkpoint(legacy)["model"]  # loadable for evaluation
+    with pytest.raises(ValueError, match="evaluation-only"):
+        az.load_checkpoint(legacy, resume=True)
+    with pytest.raises(ValueError, match="evaluation-only"):
+        az.main(["--games", "2", "--sims", "2", "--size", "4", "--max-steps", "4", "--seed", "3", "--output", str(legacy), "--resume"])
+    for flag in (["--truncation", "proxy"], ["--heur", "0.3"], ["--shape", "0.2"], ["--belief", "on"], ["--opp-frac", "0.5"]):
+        with pytest.raises(SystemExit):  # argparse error: incompatible semantics are never mixed silently
+            az.main(["--games", "2", "--sims", "2", "--size", "4", "--max-steps", "4", "--seed", "3", "--output", str(out), "--resume", *flag])
+    az.main(["--games", "2", "--sims", "2", "--size", "4", "--max-steps", "4", "--seed", "3", "--output", str(out), "--resume"])
+    assert torch.load(out, weights_only=True)["completed"] == 2
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
@@ -455,19 +553,410 @@ def test_search_finds_forced_capture_that_prior_ignores(seed):
 
 
 def test_search_determinization_respects_memory_without_belief_head():
-    """Belief head off: the sampled enemy general still avoids ever-seen cells (memory plane 15)."""
+    """Belief head off: every sampled enemy general (no sighting yet) avoids ever-seen cells and is hidden."""
     env = az.make_env(6, 50)
     state = env.init_state(jr.PRNGKey(3))
-    obs = az.get_observation(state, 0)
-    feat = az.features(obs)
-    seen = feat[15] > 0.5
+    seen = az.features(az.get_observation(state, 0))[15] > 0.5
     net = az.Net(h=6, w=6, width=16, layers=2, heads=2, frames=2, attn="dense").eval()
     s = az.Searcher(net, 6, 6, 50, np.random.default_rng(0))
-    orig = az.determinize
-    got = []
-    az.determinize = lambda *a, **k: (got.append(a[4] if len(a) > 4 else k.get("seen")), orig(*a, **k))[1]
+    orig, got = az.determinize, []
+    az.determinize = lambda *a, **k: got.append(orig(*a, **k)) or got[-1]
     try:
         s.search(state, 0, 4)
     finally:
         az.determinize = orig
-    assert got and all(g is not None and (g == seen).all() for g in got)
+    assert len(got) == 4
+    for x in got:
+        r, c = np.asarray(x.general_positions[1])
+        assert not seen[r, c] and bool(x.ownership[1][r, c]) and bool(x.generals[r, c])
+
+
+# --- memory-consistent determinization -------------------------------------------------------------------
+
+def _lost_scout():
+    """Player 0's scout sees the enemy general (5,5) and a mountain (3,4), then is lost. No general swap occurred."""
+    grid = jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2).at[3, 4].set(-2)
+    s = game.create_initial_state(grid)
+    scout = s._replace(ownership=s.ownership.at[0, 4, 4].set(True), ownership_neutral=s.ownership_neutral.at[4, 4].set(False),
+                       armies=s.armies.at[4, 4].set(3))
+    mem = az.GeneralMemory()
+    obs = game.get_observation(scout, 0)
+    mem.update(obs)
+    prev = az.stack_with(None, az.features(obs), 2)
+    lost = scout._replace(ownership=scout.ownership.at[0, 4, 4].set(False).at[1, 4, 4].set(True))
+    obs = game.get_observation(lost, 0)
+    mem.update(obs)
+    return lost, az.features(obs, prev), mem
+
+
+def _same_view(a, b):
+    oa, ob = game.get_observation(a, 0), game.get_observation(b, 0)
+    return all(np.array_equal(np.asarray(x), np.asarray(y)) for x, y in zip(oa, ob))
+
+
+def test_known_general_and_mountain_survive_in_every_sample():
+    """Reproduced failure: 0/32 samples kept the remembered general and 14/32 reclassified the remembered mountain."""
+    lost, frame, mem = _lost_scout()
+    assert mem.enemy == (5, 5) and frame[19, 5, 5] == 1 and frame[17, 3, 4] == 1
+    obs = game.get_observation(lost, 0)
+    assert bool(obs.fog_cells[5, 5]) and bool(obs.structures_in_fog[3, 4])  # both really are hidden now
+    for belief in (None, np.ones(36)):
+        for k in range(32):
+            x = az.determinize(lost, 0, np.random.default_rng(k), belief, frame, mem.enemy)
+            assert tuple(np.asarray(x.general_positions[1])) == (5, 5) and bool(x.generals[5, 5]) and bool(x.ownership[1][5, 5])
+            assert bool(x.mountains[3, 4]) and not bool(x.castles[3, 4])
+            assert _same_view(lost, x)  # current observation and public scoreboard are reproduced exactly
+    assert int(np.asarray(x.ownership[1]).sum()) == int(obs.opponent_land_count) == 2
+
+
+def test_enemy_territory_may_reoccupy_ever_seen_cells_but_general_may_not():
+    lost, frame, _ = _lost_scout()
+    seen = frame[15] > 0.5
+    assert seen[4, 4] and bool(lost.ownership[1][4, 4])  # the enemy really took the cell we once saw
+    land_on_seen, general_on_seen = 0, 0
+    for k in range(96):
+        x = az.determinize(lost, 0, np.random.default_rng(k), None, frame, None)  # no remembered general: sampled
+        land_on_seen += bool(x.ownership[1][4, 4])
+        gr, gc = np.asarray(x.general_positions[1])
+        general_on_seen += bool(seen[gr, gc])
+    assert land_on_seen > 0 and general_on_seen == 0
+
+
+def test_general_swap_moves_the_remembered_site_and_clears_the_stale_sighting():
+    grid = jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[0, 1].set(2)
+    s = game.create_initial_state(grid)
+    s = s._replace(armies=s.armies.at[0, 0].set(30).at[0, 1].set(30))
+    mem, obs = az.GeneralMemory(), game.get_observation(s, 0)
+    assert mem.update(obs) == (0, 1)
+    prev = az.stack_with(None, az.features(obs), 2)
+    acts = jnp.asarray([[0, 0, 0, 3, 0], [0, 0, 1, 2, 0]], dtype=jnp.int32)  # each general attacks the other
+    after, _ = game.step(s, acts, general_trade=True)
+    assert tuple(np.asarray(after.general_positions[0])) == (0, 1)  # generals really traded sites
+    obs = game.get_observation(after, 0)
+    frame = az.features(obs, prev)
+    assert mem.update(obs) == (0, 0)
+    assert frame[19, 0, 1] == 0 and frame[19, 0, 0] == 1  # stale sighting cleared, new one recorded
+    for k in range(8):
+        x = az.determinize(after, 0, np.random.default_rng(k), None, frame, mem.enemy)
+        assert tuple(np.asarray(x.general_positions[1])) == (0, 0) and bool(x.generals[0, 0])
+        assert tuple(np.asarray(x.general_positions[0])) == (0, 1)
+
+
+def test_general_memory_swap_inference_when_new_site_is_hidden():
+    """Own general changed cell and no enemy general is visible: it sits on our old site."""
+    from types import SimpleNamespace
+    z = np.zeros((4, 4), bool)
+
+    def view(own_gen, fog_cell=None):
+        g = z.copy(); g[own_gen] = True
+        fog = z.copy()
+        if fog_cell:
+            fog[fog_cell] = True
+        return SimpleNamespace(generals=g, owned_cells=g, opponent_cells=z, fog_cells=fog, structures_in_fog=z)
+
+    mem = az.GeneralMemory()
+    mem.update(view((0, 0)))
+    assert mem.enemy is None
+    assert mem.update(view((3, 3), fog_cell=(0, 0))) == (0, 0)
+    assert mem.update(view((3, 3), fog_cell=(0, 0))) == (0, 0)  # remembered while fogged
+    assert mem.update(view((3, 3))) is None  # visible without a general: dropped
+
+
+def test_determinize_noninterference_with_inaccessible_true_state():
+    """Two worlds with identical observation and memory but different hidden truth give identical samples."""
+    lost, frame, mem = _lost_scout()
+    other = lost._replace(  # the enemy's second cell (and its 3 armies) sit elsewhere, still fogged
+        ownership=lost.ownership.at[1, 4, 4].set(False).at[1, 4, 3].set(True),
+        ownership_neutral=lost.ownership_neutral.at[4, 4].set(True).at[4, 3].set(False),
+        armies=lost.armies.at[4, 4].set(0).at[4, 3].set(3))
+    assert _same_view(lost, other)
+    for known in (mem.enemy, None):
+        for belief in (None, np.random.default_rng(1).random(36)):
+            for k in range(6):
+                a, b = (az.determinize(w, 0, np.random.default_rng(k), belief, frame, known) for w in (lost, other))
+                for field in a._fields:
+                    assert np.array_equal(np.asarray(getattr(a, field)), np.asarray(getattr(b, field))), field
+
+
+def test_determinize_never_falls_back_to_the_true_hidden_general():
+    grid = jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2)
+    s = game.create_initial_state(grid)
+    # degenerate view: the only enemy land is a visible non-general cell, so no hidden cell can host the general
+    s = s._replace(ownership=s.ownership.at[1, 5, 5].set(False).at[1, 0, 1].set(True),
+                   ownership_neutral=s.ownership_neutral.at[5, 5].set(True).at[0, 1].set(False))
+    x = az.determinize(s, 0, np.random.default_rng(0))
+    assert tuple(np.asarray(x.general_positions[1])) == (0, 1)
+    assert not bool(x.generals[5, 5])
+
+
+# --- Gumbel root schedule vs the pinned mctx reference ---------------------------------------------------
+
+def _mctx_sequence(max_num_considered_actions, num_simulations):
+    """Independent copy of google-deepmind/mctx mctx/_src/seq_halving.py get_sequence_of_considered_visits
+    (only commit of that file: 1232e22097c8bf84da68babd8326fdc65c64c2e0), kept here as the oracle."""
+    import math
+    if max_num_considered_actions <= 1:
+        return tuple(range(num_simulations))
+    log2max = int(math.ceil(math.log2(max_num_considered_actions)))
+    sequence = []
+    visits = [0] * max_num_considered_actions
+    num_considered = max_num_considered_actions
+    while len(sequence) < num_simulations:
+        num_extra_visits = max(1, int(num_simulations / (log2max * num_considered)))
+        for _ in range(num_extra_visits):
+            sequence.extend(visits[:num_considered])
+            for i in range(num_considered):
+                visits[i] += 1
+        num_considered = max(2, num_considered // 2)
+    return tuple(sequence[:num_simulations])
+
+
+@pytest.mark.parametrize("m,sims", [(16, 32), (16, 100), (5, 60), (3, 60), (8, 10), (16, 20)])
+def test_schedule_matches_mctx_reference(m, sims):
+    assert az.considered_visits(m, sims) == _mctx_sequence(m, sims)
+    assert len(az.considered_visits(m, sims)) == sims
+    for k in range(1, 18):  # odd, tiny and ragged counts too
+        assert az.considered_visits(k, sims) == _mctx_sequence(k, sims)
+
+
+class _Bandit(az.Searcher):
+    """Production Searcher.search with controlled leaf values: the reward of a simulation depends only on the root
+    action, its visit number and the particle. Everything else (schedule, selection, targets) is production code."""
+
+    def __init__(self, m, reward, cfg=az.SearchCfg()):
+        super().__init__(types.SimpleNamespace(frames=2), 6, 6, 200, np.random.default_rng(0), cfg)
+        self.m, self.reward, self.calls, self.seen_n = m, reward, [], np.zeros(289, int)
+
+    def make_node(self, *args, **kwargs):
+        p = np.zeros(289)
+        p[:self.m] = 1 / self.m
+        return types.SimpleNamespace(prior=p, value=0.0, pid=0)
+
+    def simulate(self, root, me, first=None):
+        a = int(first)
+        v = self.reward(a, int(self.seen_n[a]), root)
+        self.calls.append((a, int(self.seen_n[a]), root.pid, self._u, v))
+        self.seen_n[a] += 1
+        self._last = v
+
+
+@pytest.fixture
+def bandit_env(monkeypatch):
+    state = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2))
+    monkeypatch.setattr(az, "determinize", lambda state, *a, **k: state)
+
+    def setup(m):
+        monkeypatch.setattr(az, "legal_mask", lambda *a: np.arange(289) < m)
+    return state, setup
+
+
+def _run_bandit(bandit_env, m, sims, reward, seed=0, noise=False, cfg=az.SearchCfg()):
+    state, setup = bandit_env
+    setup(m)
+    s = _Bandit(m, reward, cfg)
+    s.rng = np.random.default_rng(seed)
+    n = s.search(state, 0, sims, noise=noise)
+    return s, n
+
+
+@pytest.mark.parametrize("m,sims", [(5, 32), (16, 32), (16, 100), (5, 60), (3, 60), (8, 10), (16, 20), (7, 3), (1, 9), (2, 1), (16, 1)])
+def test_every_simulation_is_accounted_and_follows_the_schedule(bandit_env, m, sims):
+    s, n = _run_bandit(bandit_env, m, sims, lambda a, k, r: 0.1 * a)
+    assert n.sum() == sims == len(s.calls)
+    want = _mctx_sequence(min(m, 16), sims)
+    assert [k for _, k, _, _, _ in s.calls] == list(want)  # the visit count of the action each sim targeted
+    assert n[m:].sum() == 0 and s.target[m:].sum() == 0 and abs(s.target.sum() - 1) < 1e-5
+
+
+def test_late_evidence_can_change_the_played_action():
+    """Reproduced failure: 5 actions, 32 sims. Action 0 looks great for 7 visits and then collapses; action 1 is a steady
+    +0.3. The old schedule had already halved to action 0 and played it (Q -0.26, visits [19,7,2,2,2])."""
+    state = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2))
+    reward = lambda a, k, r: 1.0 if a == 0 and k < 7 else -1.0 if a != 1 else 0.3
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(az, "determinize", lambda state, *a, **k: state)
+        mp.setattr(az, "legal_mask", lambda *a: np.arange(289) < 5)
+        s = _Bandit(5, reward)
+        n = s.search(state, 0, 32, noise=False)
+    finally:
+        mp.undo()
+    q = np.bincount([c[0] for c in s.calls], weights=[c[4] for c in s.calls], minlength=289) / np.maximum(n, 1)
+    assert n.sum() == 32 and n[0] > 10 and n[1] > 10 and (n[2:5] == 2).all()  # both finalists keep being tested
+    assert q[0] < q[1] and q[1] == pytest.approx(0.3)
+    assert s.best == 1 and int(s.target.argmax()) == 1
+
+
+def _reference_root(prior_m, gumbel, reward, sims, cfg):
+    """numpy oracle of mctx gumbel_muzero_root_action_selection + completed-Q (qtransform_completed_by_mix_value,
+    rescale_values=True, value_scale=cfg.c_scale, maxvisit_init=cfg.c_visit) + final selection of policies.py
+    (`considered_visit = max(visit_counts)`), written directly from the reference formulas."""
+    m = len(prior_m)
+    logits = np.log(prior_m)
+    n, w = np.zeros(m), np.zeros(m)
+    table = _mctx_sequence(min(m, cfg.max_cand), sims)
+
+    def completed():
+        q = np.where(n > 0, w / np.maximum(n, 1), 0.0)
+        pr = np.exp(logits) / np.exp(logits).sum()
+        sum_n = n.sum()
+        wq = (np.where(n > 0, pr * q, 0).sum() / pr[n > 0].sum()) if sum_n else 0.0
+        mix = (0.0 + sum_n * wq) / (sum_n + 1)  # raw value 0
+        c = np.where(n > 0, q, mix)
+        c = (c - c.min()) / max(c.max() - c.min(), 1e-8)
+        return (cfg.c_visit + n.max()) * cfg.c_scale * c
+
+    def pick(considered):
+        lg = logits - logits.max()
+        score = np.maximum(-1e9, gumbel + lg + completed()) + np.where(n == considered, 0, -np.inf)
+        return int(np.argmax(score))
+
+    for i in range(sims):
+        a = pick(table[i])
+        w[a] += reward(a, int(n[a]))
+        n[a] += 1
+    best = pick(n.max())
+    policy = np.exp(logits + completed())
+    return n, best, policy / policy.sum()
+
+
+@pytest.mark.parametrize("m,sims", [(5, 32), (16, 32), (16, 100), (8, 10), (3, 60), (16, 20)])
+def test_production_root_matches_reference_oracle_with_specified_gumbel(bandit_env, m, sims):
+    cfg = az.SearchCfg(qscale="mctx", c_scale=0.1)
+    rewards = np.random.default_rng(7).uniform(-1, 1, size=(m, 3))
+    reward = lambda a, k: rewards[a, min(k, 2)]
+    for seed in range(4):
+        s, n = _run_bandit(bandit_env, m, sims, lambda a, k, r: reward(a, k), seed, noise=True, cfg=cfg)
+        gumbel = np.random.default_rng(seed).gumbel(size=289)  # Searcher draws these right after the roots (stubs consume no rng)
+        n_ref, best_ref, pol_ref = _reference_root(np.full(m, 1 / m), gumbel[:m], reward, sims, cfg)
+        assert np.array_equal(n[:m], n_ref)
+        assert s.best == best_ref
+        assert np.allclose(s.target[:m], pol_ref, atol=1e-5)  # target is the clean improved policy
+
+
+def test_gumbel_result_and_clean_target_are_distinct():
+    """With a heavy Gumbel draw the played action can differ from the target argmax; the target is noise free."""
+    state = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2))
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(az, "determinize", lambda state, *a, **k: state)
+        mp.setattr(az, "legal_mask", lambda *a: np.arange(289) < 6)
+        runs = []
+        for seed in range(30):
+            s = _Bandit(6, lambda a, k, r: 0.0)  # all actions look identical
+            s.rng = np.random.default_rng(seed)
+            s.search(state, 0, 6)
+            runs.append((s.best, s.target.copy()))
+        s0 = _Bandit(6, lambda a, k, r: 0.0)
+        s0.search(state, 0, 6, noise=False)
+    finally:
+        mp.undo()
+    assert len({b for b, _ in runs}) > 1  # exploration noise spreads the played action ...
+    assert all(np.allclose(t, runs[0][1]) for _, t in runs)  # ... while the target stays the same noise-free policy
+
+
+def test_particles_are_paired_and_cover_all_worlds():
+    state = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2))
+    mp = pytest.MonkeyPatch()
+    firsts = set()
+    try:
+        mp.setattr(az, "legal_mask", lambda *a: np.arange(289) < 16)
+        mp.setattr(az, "determinize", lambda state, *a, **k: state)
+        for seed in range(12):
+            s = _Bandit(16, lambda a, k, r: 0.0)
+            s.rng = np.random.default_rng(seed)
+            # one distinct particle id per root, assigned in creation order
+            made = []
+            s.make_node = lambda *a, made=made, **k: (made.append(len(made)), types.SimpleNamespace(
+                prior=np.where(np.arange(289) < 16, 1 / 16, 0.0), value=0.0, pid=made[-1]))[1]
+            s.search(state, 0, 32, noise=False)
+            first_round = [c for c in s.calls if c[1] == 0]
+            assert len(first_round) == 16 and len({c[2] for c in first_round}) == 1  # paired within a round
+            assert len({c[3] for c in first_round}) == 1  # and share one reply draw
+            for visit in range(2):
+                assert len({c[2] for c in s.calls if c[1] == visit}) == 1
+            assert {c[2] for c in s.calls} == set(range(4))  # every world is used within the budget
+            firsts.add(first_round[0][2])
+    finally:
+        mp.undo()
+    assert len(firsts) > 1  # the first comparison is not always particle 0
+
+
+def test_paired_root_reply_is_shared_and_valid():
+    grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[4, 4].set(2)
+    state = game.create_initial_state(grid)
+    prior = np.zeros(az.num_actions(5, 5), np.float32)
+    prior[-1] = 1
+    opponent = np.zeros_like(prior)
+    opponent[[0, 5, -1]] = [0.2, 0.3, 0.5]
+    search = az.Searcher(None, 5, 5, 1, np.random.default_rng(0))
+    node = az.Node(state, prior, opponent, 0)
+    for u, want in ((0.0, 0), (0.19, 0), (0.21, 5), (0.49, 5), (0.51, len(prior) - 1), (0.999999, len(prior) - 1)):
+        search._u = u
+        search.simulate(node, 0, len(prior) - 1)
+        assert (len(prior) - 1, want) in node.children
+
+
+# --- tactical decisions with a controlled opponent (exact one-step action values) ----------------------------
+
+def _scripted_opponent_search(monkeypatch, state, enemy_action, sims=32, seed=0):
+    """Search where the net is replaced by: uniform own prior, value 0, and an opponent that always plays `enemy_action`."""
+    def fake_eval(net, stacks, masks):
+        mine = masks[0] / masks[0].sum()
+        theirs = masks[1] / masks[1].sum()  # deeper positions: the scripted move may no longer exist
+        if masks[1][enemy_action]:
+            theirs = np.zeros(len(masks[1]))
+            theirs[enemy_action] = 1.0
+        return np.stack([mine, theirs]).astype(np.float32), np.zeros(2, np.float32)
+
+    monkeypatch.setattr(az, "evaluate", fake_eval)
+    s = az.Searcher(types.SimpleNamespace(frames=2), 5, 5, 50, np.random.default_rng(seed))
+    s.search(state, 0, sims)
+    return s
+
+
+def _true_values(state, acts, enemy_action):
+    """Exact one-step value for every root action vs the scripted reply: +-1 on a capture, 0 if the game goes on."""
+    out = {}
+    for a in acts:
+        pair = jnp.asarray([az.decode(a, 5, 5), az.decode(enemy_action, 5, 5)], dtype=jnp.int32)
+        nxt, _ = game.step(state, pair, general_trade=True)
+        out[a] = 0.0 if int(nxt.winner) < 0 else (1.0 if int(nxt.winner) == 0 else -1.0)
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_search_defends_the_general_by_reinforcing_it(monkeypatch, seed):
+    """Enemy stack (7) beside my general (3) always attacks with 6. Only moving my stack (1,0) up onto the general
+    resolves first (defensive moves go first) and holds it; waiting and every other move loses the game."""
+    grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[4, 4].set(2)
+    state = game.create_initial_state(grid)
+    state = state._replace(armies=state.armies.at[0, 0].set(3).at[0, 1].set(7).at[1, 0].set(10),
+                           ownership=state.ownership.at[1, 0, 1].set(True).at[0, 1, 0].set(True),
+                           ownership_neutral=state.ownership_neutral.at[0, 1].set(False).at[1, 0].set(False))
+    enemy = 1 * 8 + 2 * 2 + 0  # cell (0, 1), LEFT, full stack
+    s = _scripted_opponent_search(monkeypatch, state, enemy, seed=seed)
+    legal = np.flatnonzero(s.target > 0)
+    values = _true_values(state, legal, enemy)
+    good = [a for a, v in values.items() if v == 0.0]
+    assert sorted(good) == [40, 41] and len(legal) > 8  # (1,0) UP full / half hold the general; the rest lose
+    assert values[az.num_actions(5, 5) - 1] == -1.0  # waiting loses
+    prior_value = np.mean(list(values.values()))  # uniform prior's expected value
+    target_value = sum(s.target[a] * v for a, v in values.items())
+    assert s.target[good].sum() > 0.9 and s.best in good and target_value > prior_value + 0.5
+
+
+def test_search_trades_generals_when_waiting_loses(monkeypatch):
+    """Adjacent generals, enemy always attacks with 29 > my 28: waiting loses; attacking back is a general trade (value 0)."""
+    grid = jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[0, 1].set(2)
+    state = game.create_initial_state(grid)
+    state = state._replace(armies=state.armies.at[0, 0].set(28).at[0, 1].set(30))
+    enemy = 1 * 8 + 2 * 2 + 0
+    s = _scripted_opponent_search(monkeypatch, state, enemy)
+    legal = np.flatnonzero(s.target > 0)
+    values = _true_values(state, legal, enemy)
+    good = [a for a, v in values.items() if v == 0.0]
+    assert sorted(good) == [6, 7]  # RIGHT full / half from my general: the trade; everything else loses the game
+    prior_value = np.mean(list(values.values()))
+    assert s.target[good].sum() > 0.9 and s.best in good
+    assert sum(s.target[a] * v for a, v in values.items()) > prior_value + 0.5

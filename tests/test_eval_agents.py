@@ -29,3 +29,33 @@ def test_run_counts_and_ckpt_paths(tmp_path):
         ev.run(f"ckpt:{ck}", "random", 6, 2, 8, 0)  # wrong board size
     with pytest.raises(SystemExit):
         ev.make_agent("nope", 0, 8, 5)
+
+
+def test_loading_agent_b_cannot_change_agent_a(tmp_path):
+    """Per-agent semantics: A (heur .5, proxy) is untouched by constructing B (heur 0, draw)."""
+    import jax.numpy as jnp
+    from generals.core import game
+    torch.manual_seed(0)
+    paths = {}
+    for name, extra in (("a", {"heur": 0.5, "truncation": "proxy"}), ("b", {"heur": 0.0, "truncation": "draw"})):
+        paths[name] = tmp_path / f"{name}.pt"
+        torch.save({"model": ev.az.Net(5, 5).state_dict(), "args": {"size": 5, "attn": "dense", "frames": 4, **extra},
+                    "channels": ev.az.CHANNELS}, paths[name])
+    state = game.create_initial_state(jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[4, 4].set(2))
+    state = state._replace(armies=state.armies.at[0, 0].set(30))  # material score is nonzero
+    a = ev.Ckpt(str(paths["a"]), 2, 8, 5)
+    before = a.searcher.make_node(state, 0).value
+    b = ev.Ckpt(str(paths["b"]), 2, 8, 5)
+    assert a.searcher.make_node(state, 0).value == before
+    assert b.searcher.make_node(state, 0).value != before  # B really evaluates with different semantics
+    assert (a.cfg.heur, a.cfg.truncation, b.cfg.heur, b.cfg.truncation) == (0.5, "proxy", 0.0, "draw")
+    assert not hasattr(ev.az, "HEUR") and not hasattr(ev.az, "TRUNC")
+
+
+def test_proxy_adjudication_uses_real_score_not_draw_label():
+    import jax.numpy as jnp
+    from generals.core import game
+    state = game.create_initial_state(jnp.zeros((5, 5), dtype=jnp.int32).at[0, 0].set(1).at[4, 4].set(2))
+    state = state._replace(armies=state.armies.at[0, 0].set(40), time=jnp.int32(3))
+    win, proxy = ev.play(None, [], state, None, 3)  # already at the limit: no moves are played
+    assert win == -1 and proxy > 0

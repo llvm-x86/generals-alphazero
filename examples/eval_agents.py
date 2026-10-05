@@ -4,10 +4,11 @@ Play agent A against agent B on SxS boards, side-swapped, with fixed seeds.
     python examples/eval_agents.py expander random --size 8 --games 200 --max-steps 200
     python examples/eval_agents.py ckpt:az.pt expander --size 6 --games 20 --sims 8
 
-Agents: random, expander, hunter, harvester, ckpt:<path> (az_selfplay checkpoint; policy-only argmax,
-or PUCT search with --sims N). Game i uses map seed+i//2 and puts A in seat i%2, so each map is
+Agents: random, expander, hunter, harvester, ckpt:<path> (az_selfplay checkpoint; policy-only argmax, or the
+current source's Gumbel-root/PUCT-interior search with --sims N: a standardized engine applied to the checkpoint's
+weights and recorded heur/truncation, not necessarily the original actor; legacy pre-schema checkpoints load eval-only). Game i uses map seed+i//2 and puts A in seat i%2, so each map is
 played from both seats. A truncated game counts as a draw; a second table adjudicates draws by the
-sign of az_selfplay.outcome (score proxy, not a real win). Intervals are Wilson 95%.
+sign of az_selfplay.score (material proxy, not a real win). Intervals are Wilson 95%.
 """
 import argparse
 import importlib.util
@@ -50,10 +51,15 @@ class Ckpt:
         a = ck["args"]
         if a["size"] != size:
             raise SystemExit(f"checkpoint was trained for --size {a['size']}, not {size}")
+        if ck.get("schema") is None:
+            print(f"note: {path} is a legacy (pre-schema) checkpoint: eval-only; weights run under CURRENT source with "
+                  f"heur={a.get('heur', 0.0)}, truncation={a.get('truncation', 'proxy')}, not the original actor")
         if a.get("max_steps", max_steps) != max_steps:
             print(f"note: checkpoint trained with --max-steps {a['max_steps']}, evaluating at {max_steps}")
-        # search/value settings the checkpoint was trained with (module globals: one ckpt's settings per process)
-        az.HEUR, az.TRUNC = a.get("heur", 0.0), a.get("truncation", "proxy")
+        # search/value settings the checkpoint was trained with: per-agent, never shared module state
+        # (legacy checkpoints without a record were trained with the proxy truncation value)
+        self.cfg = az.SearchCfg(heur=a.get("heur", 0.0), truncation=a.get("truncation", "proxy"), belief=belief,
+                                incremental=a.get("incremental", False))
         az.FAST = az.fastkernels.available()  # matches torch to ~3e-7 (tests/test_fastkernels.py)
         self.net = az.Net(size, size, frames=a["frames"], attn=a["attn"], stream=a.get("incremental", False),
                           order=a.get("hybrid_order"))
@@ -61,16 +67,17 @@ class Ckpt:
         self.net.eval()
         self.sims, self.size = sims, size
         self.rng = np.random.default_rng(0)
-        self.searcher = az.Searcher(self.net, size, size, max_steps, self.rng, belief)
-        self.hist = None
+        self.searcher = az.Searcher(self.net, size, size, max_steps, self.rng, self.cfg)
+        self.hist, self.mem = None, az.GeneralMemory()
 
     def reset(self):
-        self.hist = None
+        self.hist, self.mem = None, az.GeneralMemory()
 
     def act(self, state, me, key):
         obs = get_observation(state, me)
+        self.mem.update(obs)
         if self.sims:
-            self.searcher.search(state, me, self.sims, self.hist, noise=False)
+            self.searcher.search(state, me, self.sims, self.hist, noise=False, mem=self.mem)
             a = self.searcher.best
         else:
             mask = az.legal_mask(obs, self.size, self.size)
@@ -108,7 +115,7 @@ def play(env, agents, state, key, max_steps):
         acts = jnp.asarray(np.stack([agents[i].act(state, i, ks[i]) for i in (0, 1)]), dtype=jnp.int32)
         state, _ = game_step(state, acts, general_trade=True)
     win = int(state.winner)
-    return win, float(az.outcome(state, 0, max_steps))
+    return win, float(az.score(state, 0))  # real material proxy, only consulted for draws
 
 
 def run(name_a, name_b, size, games, max_steps, seed, sims=0, belief=False):
@@ -145,7 +152,7 @@ def main(argv=None):
     ap.add_argument("--games", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--sims", type=int, default=0, help="PUCT simulations per ckpt move (0 = policy argmax)")
+    ap.add_argument("--sims", type=int, default=0, help="root-search simulations per ckpt move (0 = policy argmax)")
     ap.add_argument("--belief", action="store_true", help="ckpt agents sample determinizations from the belief head")
     args = ap.parse_args(argv)
     if args.games < 1 or args.size < 4 or args.max_steps < 1 or args.sims < 0:
@@ -155,7 +162,7 @@ def main(argv=None):
     print(f"{args.agent_a} (A) vs {args.agent_b} (B): {args.games} games on {args.size}x{args.size}, "
           f"max_steps {args.max_steps}, seeds {args.seed}..{args.seed + (args.games - 1) // 2}, sims {args.sims}")
     report("real outcomes (truncation = draw)", args.agent_a, args.agent_b, real, args.games)
-    report("draws adjudicated by score proxy (sign of az_selfplay.outcome; NOT real wins)", args.agent_a, args.agent_b, adj, args.games)
+    report("draws adjudicated by material proxy (sign of az_selfplay.score; NOT real wins)", args.agent_a, args.agent_b, adj, args.games)
     return real, adj
 
 

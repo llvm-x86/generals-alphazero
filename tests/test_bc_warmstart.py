@@ -22,11 +22,16 @@ def test_teacher_samples_legal_and_bc_checkpoint_resumes(tmp_path):
     env = az.make_env(5, 12)
     s = bc.rollout(env, 5, 3, 12, np.random.default_rng(0), 0.5)
     assert s and all(m[p.argmax()] and p.sum() == 1 for _, p, m, _, _ in s)
-    out = tmp_path / "bc.pt"
-    bc.main(["--bc-games", "5", "--bc-epochs", "1", "--size", "5", "--max-steps", "12", "--sims", "2", "--output", str(out)])
-    # self-play --resume must accept the BC checkpoint
-    az.main(["--games", "1", "--sims", "2", "--size", "5", "--max-steps", "12", "--resume", "--output", str(out)])
+    start, out = tmp_path / "bc.pt", tmp_path / "az.pt"
+    bc.main(["--bc-games", "5", "--bc-epochs", "1", "--size", "5", "--max-steps", "12", "--sims", "2", "--output", str(start)])
+    # BC's teacher tuples cannot be replayed as AlphaZero returns; transfer weights into a fresh schema-2 run.
+    az.main(["--games", "1", "--sims", "2", "--size", "5", "--max-steps", "12",
+             "--init-weights", str(start), "--output", str(out)])
     assert az.load_checkpoint(out)["completed"] == 1
+    assert az.load_checkpoint(out)["init_weights"] == str(start)
+    with pytest.raises(ValueError, match="evaluation-only"):
+        az.main(["--games", "1", "--sims", "2", "--size", "5", "--max-steps", "12",
+                 "--resume", "--output", str(start)])
 
 
 def test_argmax_teacher_is_deterministic_legal_and_dagger_runs(tmp_path):

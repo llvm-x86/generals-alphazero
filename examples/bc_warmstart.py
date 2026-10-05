@@ -159,8 +159,9 @@ def main(argv=None):
     net = az.Net(h, h, frames=args.frames, attn=args.attn)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3, weight_decay=1e-4)
     for e in range(args.bc_epochs):
-        lp, lv = az.train_step(net, opt, train, epochs=1)
-        print(f"epoch {e + 1}/{args.bc_epochs}: last-batch policy loss {lp:.3f}, value loss {lv:.3f}, "
+        metrics = az.train_step(net, opt, train, epochs=1)
+        lp, lv = metrics["online"]["policy"], metrics["online"]["value"]
+        print(f"epoch {e + 1}/{args.bc_epochs}: online policy loss {lp:.3f}, value loss {lv:.3f}, "
               f"held-out teacher-action accuracy {accuracy(net, held):.3f}", flush=True)
     for r in range(args.dagger_rounds):  # DAgger: student plays (seat alternates, teacher/student opponent), teacher labels
         net.eval()
