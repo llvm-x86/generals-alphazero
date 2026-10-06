@@ -37,7 +37,7 @@ class Builtin:
     def __init__(self, cls):
         self.agent = cls()
 
-    def reset(self):
+    def reset(self, seed=None):
         self.agent.reset()
 
     def act(self, state, me, key):
@@ -71,8 +71,11 @@ class Ckpt:
         self.searcher = az.Searcher(self.net, size, size, max_steps, self.rng, self.cfg)
         self.hist, self.mem = None, az.GeneralMemory()
 
-    def reset(self):
+    def reset(self, seed=None):
         self.hist, self.mem = None, az.GeneralMemory()
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+            self.searcher.rng = self.rng
 
     def act(self, state, me, key):
         obs = get_observation(state, me)
@@ -110,7 +113,7 @@ def wilson(k, n, z=1.96):
 def play(env, agents, state, key, max_steps):
     """One game; agents[i] sits in seat i. Returns (winner seat or -1, seat-0 score-proxy sign)."""
     for a in agents:
-        a.reset()
+        a.reset(int(np.asarray(key)[1]))  # both seats on paired maps reuse the same search-randomness seed
     while int(state.winner) < 0 and int(state.time) < max_steps:
         key, *ks = jrandom.split(key, 3)
         acts = jnp.asarray(np.stack([agents[i].act(state, i, ks[i]) for i in (0, 1)]), dtype=jnp.int32)
@@ -127,7 +130,7 @@ def run(name_a, name_b, size, games, max_steps, seed, sims=0, belief=False, retu
     for g in range(games):
         a_seat = g % 2
         state = env.init_state(jrandom.PRNGKey(seed + g // 2))
-        win, proxy = play(env, [a, b] if a_seat == 0 else [b, a], state, jrandom.PRNGKey(10_000 + seed + g), max_steps)
+        win, proxy = play(env, [a, b] if a_seat == 0 else [b, a], state, jrandom.PRNGKey(10_000 + seed + g // 2), max_steps)
         if win >= 0:
             i = 0 if win == a_seat else 1
             real[i] += 1

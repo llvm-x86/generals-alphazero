@@ -31,6 +31,11 @@ def test_run_counts_and_ckpt_paths(tmp_path):
     for sims in (0, 2):  # policy argmax and PUCT
         real, adj = ev.run(f"ckpt:{ck}", "random", 5, 2, 8, 0, sims)
         assert real.sum() == adj.sum() == 2
+    agent = ev.Ckpt(str(ck), 2, 8, 5)
+    agent.reset(42)
+    first = agent.rng.integers(1_000_000)
+    agent.reset(42)
+    assert agent.rng.integers(1_000_000) == first
     with pytest.raises(SystemExit):
         ev.run(f"ckpt:{ck}", "random", 6, 2, 8, 0)  # wrong board size
     with pytest.raises(SystemExit):
