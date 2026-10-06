@@ -37,10 +37,10 @@ pip install -e '.[alphazero]'
 
 `examples/az_selfplay.py` trains a pixel-level spacetime transformer (one token per cell per frame
 over the last 4 own observations, a global token for value, no pooling or
-convolution) on PUCT visits and self-play. Search samples hidden terrain, enemy territory/armies and
-general position **from each player's observation and public totals**, rather
-than expanding the true hidden board. Opponent replies are resampled on each
-search visit. Start with a small smoke run:
+convolution) on Gumbel-root policy-improvement targets and self-play; interior search uses PUCT.
+Search samples hidden terrain, enemy territory/armies and general position **from each player's
+observation and public totals**, not the true hidden board. Root candidates share sampled
+worlds/replies; interior opponent replies are sampled. Start with a small smoke run:
 
 ```bash
 PYTHONPATH=. python examples/az_selfplay.py --games 1 --sims 2 --size 4 --max-steps 12 --output checkpoint.pt
@@ -54,8 +54,9 @@ castle prior (`CASTLE_FRACTION`: 0.65 for 6x6, 0.63 for 8x8) was measured as tru
 `structures_in_fog` cells in ~400 Expander-vs-Expander states per size on those boards.
 
 Evaluate against built-in agents (random, expander, hunter, harvester) or a checkpoint
-(`ckpt:<path>`, policy argmax, or `--sims N` for search), side-swapped, with Wilson 95% intervals.
-Truncated games are draws; a second table adjudicates them by the score proxy (not real wins):
+(`ckpt:<path>`, policy argmax, or `--sims N` for search), on side-swapped map pairs.
+Real wins/losses/draws have Wilson intervals and match score has a paired-map bootstrap interval;
+material adjudication of draws is reported separately and is **not** a real win:
 
 ```bash
 PYTHONPATH=. python examples/eval_agents.py expander random --size 8 --games 200 --max-steps 500
@@ -65,19 +66,21 @@ Memory and belief. Every frame carries 5 memory planes (ever-seen, last-seen ene
 mountains, last-seen castles, sticky enemy-general sighting; `CHANNELS = 20`), updated from the player's
 own observations and carried through the frame history, search nodes and self-play. Checkpoints record
 `channels`; loading one with a different count (e.g. from before memory planes) raises a clear error.
-An auxiliary belief head predicts the enemy general's cell, masked to cells that are not own, never seen
-or known mountain/castle; it is trained (weight 0.1) with cross-entropy against the true cell only while
-the general is unseen, and the true cell is never a net input. `--belief on` (also `eval_agents.py
---belief`) makes `determinize` draw the general from that belief, bias hidden enemy land toward it and
-leave ever-seen cells out of the hidden-land support (default off). Held-out check
+An auxiliary belief head predicts the enemy general's cell, masked to still-plausible unseen
+cells; it is trained (weight 0.1) with cross-entropy against the true cell only until that general
+has been seen, and the true cell is never a net input. `--belief on` (also `eval_agents.py
+--belief`) samples its hidden location from that head when not already known; remembered
+terrain and a re-hidden general remain fixed, but enemy territory can reoccupy seen cells.
+Held-out check
 (`examples/belief_experiment.py`, 8x8 Expander-vs-Expander, split by game): 400 train / 100 validation / 300 held-out games
 (798 train after adding 400 more), 3 epochs chosen on validation: mean P(true general) 0.136 learned vs 0.027
 uniform over the plausible cells (5.05x) on 8,433 held-out rows. In a 112-game side-swapped A/B vs Expander
 (6x6, untrained net, 8 sims) `--belief` on and off gave identical results, so search impact is unmeasured.
 
 Behaviour-cloning warm start (`examples/bc_warmstart.py`): clones Expander (half the games with 15% random-move noise,
-clean label) from both seats' histories, split by game, then `az_selfplay.py --resume` fine-tunes from the checkpoint
-(pass the same `--size/--sims/--max-steps/--seed`). Measured on 6x6, 150 steps, 150 games (29k train samples, 10 epochs):
+clean label) from both seats' histories, split by game. To train with those weights, use
+`az_selfplay.py --init-weights bc.pt --output az.pt` with matching `--size/--attn/--frames`; this starts
+fresh replay/optimizer state. Legacy BC replay cannot be resumed as AlphaZero data. Measured on 6x6, 150 steps, 150 games (29k train samples, 10 epochs):
 held-out teacher-action accuracy 0.317 (Expander samples its move, so accuracy is capped); policy-argmax vs Random,
 100 games: 14 W / 13 L / 73 D (Expander itself: 74/2/24) -- the 90% bar was NOT met.
 
@@ -93,13 +96,15 @@ No variant reached the 90% bar; best was a *sampled* policy from a 300-step samp
 Expander does not hunt the general: on 8x8 at `--max-steps 200` roughly 44% of its games vs Random
 are truncated draws, so use a longer limit when you want real captures.
 
-Real wins/losses train the value head with +1/-1. Games cut off at
-`--max-steps` use a bounded army/land **score proxy**, not a falsely labeled
-draw. The net sees 4 frames of memory and samples only four candidate boards per search;
-it is not an information-set solver.
-Training on 4×4 smoke boards does not produce a ranked-ready model. Evaluate
-on held-out maps and strong opponents before any live use. Checkpoints are
-saved atomically after each game; load only checkpoints you trust.
+Real wins/losses train the value head with +1/-1; unfinished games at `--max-steps` are
+**draws (0)** in the default finite-horizon objective. `--truncation proxy` is opt-in and
+changes that objective. The default net sees 4 frames of memory; sampled hidden-world trees
+are not an information-set solver. Checkpoints store versioned replay, raw outcomes, search
+semantics and code identity; incompatible legacy replay is evaluation-only. Load only checkpoints
+you trust. A corrected 6x6, 200-step, 50-game self-play control did **not** show strength gains:
+g50 vs g0 drew 40/40 prior-only games and 20/20 eight-simulation games on side-swapped maps.
+On 24 held-out games the g50 value MSE was 0.306 versus 0.278 for constant zero.
+This is not a ranked-ready agent; evaluate on held-out maps and stronger opponents before live use.
 `--attn pisa` swaps dense attention for a pure-PyTorch implementation of
 [PISA](https://arxiv.org/abs/2609.31093) (pyramid top-K block-sparse attention;
 mean-pooled key pyramid, LogSumExp-scored coarse-to-fine block selection).
