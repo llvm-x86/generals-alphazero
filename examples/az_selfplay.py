@@ -47,7 +47,7 @@ from generals.core.game import step as game_step
 FAST = False  # --fast: fused AVX-512 PISA attention in no-grad inference (examples/fastkernels), PyTorch otherwise
 CHANNELS = 20  # 15 current-view planes + 5 memory planes (see features)
 SCHEMA = 2  # checkpoint/replay schema: 2 = Sample records, semantics + code identity recorded
-SEARCH_ID = "gumbel-root(mctx 1232e22 seq-halving)+puct-interior;paired-particles;v2"
+SEARCH_ID = "gumbel-root(mctx 1232e22 seq-halving)+puct-interior;world-blocks(R worlds x halving blocks);v3"
 PROBE_N = 256  # positions of the newest game evaluated before/after each update
 BELIEF_WEIGHT = 0.1  # auxiliary enemy-general cross-entropy weight in train_step
 FRAMES = 4  # default number of past own-observation frames the net attends over (fog memory)
@@ -648,7 +648,7 @@ class Searcher:
     def __init__(self, net, h, w, max_steps, rng, cfg=SearchCfg()):
         self.net, self.h, self.w, self.max_steps, self.rng, self.cfg = net, h, w, max_steps, rng, cfg
         self.belief, self.incremental = cfg.belief, cfg.incremental  # incremental: a child costs one net step
-        self._u = None  # shared root-reply uniform, set only inside search()
+        self._u = self._d = None  # shared root-reply uniform / diag counters, set only inside search()
         if cfg.incremental and not net.stream:
             raise ValueError("incremental search needs Net(stream=True)")
 
@@ -673,15 +673,19 @@ class Searcher:
         p, v = priors(logits, v, masks)
         return Node(state, p[0], p[1], leaf_value(float(v[0]), state, me, self.cfg.heur), *stacks, st)
 
-    def search(self, state, me, sims, prev=None, noise=True, prev_st=None, mem=None):
+    def search(self, state, me, sims, prev=None, noise=True, prev_st=None, mem=None, diag=False):
         """Root search: Gumbel + sequential halving as in mctx (the interior is PUCT: a Gumbel-root/PUCT hybrid, not
-        full Gumbel AlphaZero). Exactly `sims` simulations, each forced onto the legal root action that mctx's
-        score_considered picks for the scheduled visit count (considered_visits), over `cfg.particles` determinized roots.
-        Visit j of every action uses particle (j + random offset) % P and the same sampled opponent reply (common random
-        numbers: candidates are compared in the same imagined world and reply, and later visits cover other worlds).
-        Sets `best` (the action to play: Gumbel score among the most-visited actions, mctx's final selection),
-        `target` (improved policy softmax(log prior + sigma(completed q)): the CLEAN training label, no Gumbel noise)
-        and `root_q`. noise=False drops the Gumbel draw (evaluation)."""
+        full Gumbel AlphaZero). Exactly `sims` simulations over R determinized roots ("worlds").
+
+        Budget accounting (self.plan): R = min(cfg.particles, sims // 2) worlds; one *visit* of a root action is a block
+        of R simulations, one per world, each world a fixed (particle, stratified root-reply uniform) pair shared by all
+        candidates (common random numbers; a revisit re-enters the same joint edge and so can deepen). The mctx
+        sequential-halving schedule runs over the B = sims // R blocks, so no candidate is ever eliminated on fewer than R
+        worlds, and candidates m = min(legal, max_cand, B). When the budget cannot give every requested candidate R worlds
+        (sims=32, R=4: 8 candidates, not 16) m / R are reduced and the reason is listed in plan["limited"]; the sims % R
+        leftover go one world at a time to the finalists. Sets `best` (Gumbel score among the most-visited actions, mctx's
+        final selection), `target` (improved policy softmax(log prior + sigma(completed q)): the CLEAN label) and `root_q`.
+        noise=False drops the Gumbel draw. diag=True also fills self.summary (see _summarize); off by default (no cost)."""
         stack = stack_with(prev, features(get_observation(state, me), prev), self.net.frames)
         frame = stack[-1]
         if mem is not None:  # remembered enemy general (also handles mutual general swaps)
@@ -697,41 +701,90 @@ class Searcher:
                 else:
                     logits = self.net(torch.from_numpy(stack[None]), True)[2][0]
             bel = F.softmax(logits, 0).numpy()
-        roots = [self.make_node(determinize(state, me, self.rng, bel, frame, known), me, prev, None, prev_st)
-                 for _ in range(min(self.cfg.particles, sims))]
         mask = legal_mask(get_observation(state, me), self.h, self.w)
+        legal = mask.astype(bool)
+        R = max(1, min(self.cfg.particles, sims // 2))  # worlds per visit: keep >= 2 candidates comparable
+        blocks = sims // R
+        want = min(int(legal.sum()), self.cfg.max_cand)
+        m = min(want, blocks)
+        self.plan = {"sims": sims, "worlds": R, "blocks": blocks, "candidates": m, "leftover": sims - blocks * R, "limited": []}
+        if R < self.cfg.particles:
+            self.plan["limited"].append(f"{R} worlds per candidate < particles={self.cfg.particles} (sims={sims})")
+        if m < want:
+            self.plan["limited"].append(f"{m} candidates < {want} wanted: {sims} sims give {R} worlds to at most {blocks} candidates")
+        roots = [self.make_node(determinize(state, me, self.rng, bel, frame, known), me, prev, None, prev_st) for _ in range(R)]
         prior = np.where(mask, np.maximum(roots[0].prior, 1e-12), 0.0)  # the net sees only my observation: identical across roots
         value = float(np.mean([r.value for r in roots]))
-        legal = mask.astype(bool)
         logp = np.log(np.where(mask, prior, 1.0))
         g = self.rng.gumbel(size=len(prior)) if noise else np.zeros(len(prior))
-        schedule = considered_visits(min(len(np.flatnonzero(legal)), self.cfg.max_cand), sims)
-        offset = int(self.rng.integers(len(roots)))
-        shared_u = {}  # visit number -> uniform for the shared root opponent reply
-        n, w = np.zeros(len(prior)), np.zeros(len(prior))
+        schedule = considered_visits(m, blocks)
+        us = (self.rng.permutation(R) + self.rng.random(R)) / R  # stratified root-reply uniform of each world
+        n, w, nb = np.zeros(len(prior)), np.zeros(len(prior)), np.zeros(len(prior))
         self.particles_used = []
+        self._d = {"s": [], "depth": {}, "edges": {}} if diag else None
+
+        def run(a, k):
+            self._u = float(us[k])
+            self.particles_used.append(k)
+            self.simulate(roots[k], me, a)
+            n[a] += 1
+            w[a] += self._last
+            if diag:
+                self._d["s"].append((a, k, self._root_edge[1], self._last))
+
         for considered in schedule:
-            s = score_considered(considered, g, logp, sigma_q(prior, n, w, value, self.cfg), n, legal)
+            s = score_considered(considered, g, logp, sigma_q(prior, n, w, value, self.cfg), n=nb, legal=legal)
             if not np.isfinite(s).any():
                 raise RuntimeError(f"no root action has {considered} visits: broken schedule")
             a = int(np.argmax(s))
-            j = int(n[a])
-            self._u = shared_u.setdefault(j, float(self.rng.random()))
-            self.particles_used.append((j + offset) % len(roots))
-            self.simulate(roots[self.particles_used[-1]], me, a)
-            n[a] += 1
-            w[a] += self._last
+            for k in range(R):
+                run(a, k)
+            nb[a] += 1
+        for _ in range(self.plan["leftover"]):  # finalists only, one world at a time (cycling)
+            s = score_considered(nb.max(), g, logp, sigma_q(prior, n, w, value, self.cfg), nb, legal)
+            a = int(np.argmax(s))
+            run(a, int(n[a]) % R)
         self._u = None
-        top = score_considered(n.max(), g, logp, sigma_q(prior, n, w, value, self.cfg), n, legal)
+        top = score_considered(nb.max(), g, logp, sigma_q(prior, n, w, value, self.cfg), nb, legal)
         self.best = int(np.argmax(top))
         self.target = improved_policy(prior, n, w, value, self.cfg)
         self.root_q = float((self.target * mixed_q(prior, n, w, value)).sum())  # `me` view
+        self.root_n, self.root_w = n.copy(), w.copy()
+        self.summary = self._summarize() if diag else None
+        self._d = None
         return n.astype(np.float32)
+
+    def _summarize(self):
+        """Per-decision counters (diag=True): per considered candidate the samples, distinct worlds / root replies, mean Q,
+        sample variance and standard error of that mean; the expanded-depth histogram; joint-edge reuse per level (an
+        edge is (own action, sampled opponent action); `hit` = the sampled edge already existed, so the simulation went
+        deeper instead of expanding); and the Q gap between the two most-visited actions with its paired (same world)
+        standard error."""
+        per, byw = {}, {}
+        for a, k, o, v in self._d["s"]:
+            e = per.setdefault(a, {"v": [], "worlds": set(), "replies": set()})
+            e["v"].append(v); e["worlds"].add(k); e["replies"].add(o)
+            byw.setdefault(a, {}).setdefault(k, []).append(v)
+        cand = {}
+        for a, e in per.items():
+            v = np.asarray(e["v"])
+            var = float(v.var(ddof=1)) if len(v) > 1 else float("nan")
+            cand[a] = {"n": len(v), "worlds": len(e["worlds"]), "replies": len(e["replies"]), "q": float(v.mean()),
+                       "var": var, "se": math.sqrt(var / len(v)) if len(v) > 1 else float("nan")}
+        out = {"plan": dict(self.plan), "candidates": cand, "depth": dict(sorted(self._d["depth"].items())),
+               "edges": {lvl: {"new": x[0], "hit": x[1]} for lvl, x in sorted(self._d["edges"].items())}}
+        top = sorted(cand, key=lambda a: (-cand[a]["n"], -cand[a]["q"]))[:2]
+        if len(top) == 2:
+            common = set(byw[top[0]]) & set(byw[top[1]])
+            d = np.array([np.mean(byw[top[0]][k]) - np.mean(byw[top[1]][k]) for k in sorted(common)])
+            out["gap"] = {"actions": top, "gap": float(d.mean()), "paired_se": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else float("nan"), "worlds": len(d)}
+        return out
 
     def simulate(self, root, me, first=None):
         """One simulation from `root`; `first` forces the root action (and, when `self._u` is set, the root opponent
         reply is drawn by inverse CDF from that shared uniform). Leaf value lands in self._last."""
         path, node = [], root
+        d = getattr(self, "_d", None)
         while True:
             if first is not None and node is root:
                 a = first
@@ -748,7 +801,11 @@ class Searcher:
             else:
                 opp_a = int(self.rng.choice(len(node.opp_prior), p=node.opp_prior / node.opp_prior.sum()))
             edge = (a, opp_a)
+            if node is root:
+                self._root_edge = edge
             path.append((node, a))
+            if d is not None:
+                d["edges"].setdefault(len(path), [0, 0])[edge in node.children] += 1
             if edge not in node.children:
                 v = self.expand(node, edge, me)
                 break
@@ -757,6 +814,8 @@ class Searcher:
                 v = term
                 break
             node = child
+        if d is not None:
+            d["depth"][len(path)] = d["depth"].get(len(path), 0) + 1
         for nd, act in reversed(path):  # outcome stays from `me` view; no sign flip (simultaneous moves)
             nd.n[act] += 1
             nd.w[act] += v

@@ -562,7 +562,7 @@ def test_search_determinization_respects_memory_without_belief_head():
     orig, got = az.determinize, []
     az.determinize = lambda *a, **k: got.append(orig(*a, **k)) or got[-1]
     try:
-        s.search(state, 0, 4)
+        s.search(state, 0, 8)
     finally:
         az.determinize = orig
     assert len(got) == 4
@@ -759,20 +759,45 @@ def _run_bandit(bandit_env, m, sims, reward, seed=0, noise=False, cfg=az.SearchC
     return s, n
 
 
-@pytest.mark.parametrize("m,sims", [(5, 32), (16, 32), (16, 100), (5, 60), (3, 60), (8, 10), (16, 20), (7, 3), (1, 9), (2, 1), (16, 1)])
+def _budget(m, sims, particles=4, max_cand=16):
+    """Independent restatement of the per-decision budget rule: (worlds R, blocks B, candidates)."""
+    R = max(1, min(particles, sims // 2))
+    return R, sims // R, min(m, max_cand, sims // R)
+
+
+@pytest.mark.parametrize("m,sims", [(5, 32), (16, 32), (16, 100), (5, 60), (3, 60), (8, 10), (16, 20), (7, 3), (1, 9), (2, 1), (16, 1), (7, 7)])
 def test_every_simulation_is_accounted_and_follows_the_schedule(bandit_env, m, sims):
+    """One visit = a block of R simulations, one per world; the mctx schedule runs over blocks, so every considered
+    candidate is measured in all R worlds before anything can be eliminated; leftovers go to finalists."""
     s, n = _run_bandit(bandit_env, m, sims, lambda a, k, r: 0.1 * a)
+    R, B, mc = _budget(m, sims)
     assert n.sum() == sims == len(s.calls)
-    want = _mctx_sequence(min(m, 16), sims)
-    assert [k for _, k, _, _, _ in s.calls] == list(want)  # the visit count of the action each sim targeted
+    assert s.plan["worlds"] == R and s.plan["blocks"] == B and s.plan["candidates"] == mc and s.plan["leftover"] == sims - R * B
+    table = _mctx_sequence(mc, B)
+    blocks = [s.calls[i * R:(i + 1) * R] for i in range(B)]
+    for want, block in zip(table, blocks):
+        assert len({c[0] for c in block}) == 1  # one action per block
+        assert [c[1] for c in block] == [R * want + i for i in range(R)]  # its want-th visit, all R worlds in order
     assert n[m:].sum() == 0 and s.target[m:].sum() == 0 and abs(s.target.sum() - 1) < 1e-5
+    assert n[n > 0].min() >= R  # nothing is ever judged on fewer worlds than declared
+    assert bool(s.plan["limited"]) == (R < 4 or mc < min(m, 16))  # a reduced plan is always declared
+
+
+def test_budget_plan_declares_what_it_cannot_cover(bandit_env):
+    """32 sims, 16 candidates, 4 worlds would need 64: the plan must say so and keep 4 worlds on 8 candidates, not 16 on 1."""
+    s, n = _run_bandit(bandit_env, 16, 32, lambda a, k, r: 0.0)
+    assert (s.plan["worlds"], s.plan["candidates"], s.plan["blocks"]) == (4, 8, 8)
+    assert len(s.plan["limited"]) == 1 and "8 candidates < 16" in s.plan["limited"][0]
+    assert (n > 0).sum() == 8 and n[n > 0].min() == 4
+    s, n = _run_bandit(bandit_env, 16, 256, lambda a, k, r: 0.0)  # enough budget: no limitation, all 16 get 4 worlds
+    assert s.plan["limited"] == [] and (n > 0).sum() == 16 and n[n > 0].min() >= 4
 
 
 def test_late_evidence_can_change_the_played_action():
-    """Reproduced failure: 5 actions, 32 sims. Action 0 looks great for 7 visits and then collapses; action 1 is a steady
-    +0.3. The old schedule had already halved to action 0 and played it (Q -0.26, visits [19,7,2,2,2])."""
+    """5 actions, 32 sims = 8 blocks of 4 worlds. Action 0 looks great on its first block and then collapses; action 1 is a
+    steady +0.3. Halving must keep testing both finalists, and the second block exposes action 0."""
     state = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2))
-    reward = lambda a, k, r: 1.0 if a == 0 and k < 7 else -1.0 if a != 1 else 0.3
+    reward = lambda a, k, r: (1.0 if k < 4 else -1.0) if a == 0 else 0.3 if a == 1 else -1.0
     mp = pytest.MonkeyPatch()
     try:
         mp.setattr(az, "determinize", lambda state, *a, **k: state)
@@ -782,7 +807,7 @@ def test_late_evidence_can_change_the_played_action():
     finally:
         mp.undo()
     q = np.bincount([c[0] for c in s.calls], weights=[c[4] for c in s.calls], minlength=289) / np.maximum(n, 1)
-    assert n.sum() == 32 and n[0] > 10 and n[1] > 10 and (n[2:5] == 2).all()  # both finalists keep being tested
+    assert n.sum() == 32 and n[0] >= 8 and n[1] >= 12 and (n[2:5] == 4).all()
     assert q[0] < q[1] and q[1] == pytest.approx(0.3)
     assert s.best == 1 and int(s.target.argmax()) == 1
 
@@ -790,11 +815,13 @@ def test_late_evidence_can_change_the_played_action():
 def _reference_root(prior_m, gumbel, reward, sims, cfg):
     """numpy oracle of mctx gumbel_muzero_root_action_selection + completed-Q (qtransform_completed_by_mix_value,
     rescale_values=True, value_scale=cfg.c_scale, maxvisit_init=cfg.c_visit) + final selection of policies.py
-    (`considered_visit = max(visit_counts)`), written directly from the reference formulas."""
+    (`considered_visit = max(visit_counts)`), written directly from the reference formulas, with the visit unit changed
+    to a block of R worlds (R, B from _budget); `reward(a, k)` is the k-th sample of action a."""
     m = len(prior_m)
     logits = np.log(prior_m)
-    n, w = np.zeros(m), np.zeros(m)
-    table = _mctx_sequence(min(m, cfg.max_cand), sims)
+    R, B, mc = _budget(m, sims, cfg.particles, cfg.max_cand)
+    n, w, nb = np.zeros(m), np.zeros(m), np.zeros(m)
+    table = _mctx_sequence(mc, B)
 
     def completed():
         q = np.where(n > 0, w / np.maximum(n, 1), 0.0)
@@ -808,14 +835,20 @@ def _reference_root(prior_m, gumbel, reward, sims, cfg):
 
     def pick(considered):
         lg = logits - logits.max()
-        score = np.maximum(-1e9, gumbel + lg + completed()) + np.where(n == considered, 0, -np.inf)
+        score = np.maximum(-1e9, gumbel + lg + completed()) + np.where(nb == considered, 0, -np.inf)
         return int(np.argmax(score))
 
-    for i in range(sims):
-        a = pick(table[i])
+    for want in table:
+        a = pick(want)
+        for _ in range(R):
+            w[a] += reward(a, int(n[a]))
+            n[a] += 1
+        nb[a] += 1
+    for _ in range(sims - B * R):
+        a = pick(nb.max())
         w[a] += reward(a, int(n[a]))
         n[a] += 1
-    best = pick(n.max())
+    best = pick(nb.max())
     policy = np.exp(logits + completed())
     return n, best, policy / policy.sum()
 
@@ -824,7 +857,7 @@ def _reference_root(prior_m, gumbel, reward, sims, cfg):
 def test_production_root_matches_reference_oracle_with_specified_gumbel(bandit_env, m, sims):
     cfg = az.SearchCfg(qscale="mctx", c_scale=0.1)
     rewards = np.random.default_rng(7).uniform(-1, 1, size=(m, 3))
-    reward = lambda a, k: rewards[a, min(k, 2)]
+    reward = lambda a, k: rewards[a, min(k // 4, 2)]
     for seed in range(4):
         s, n = _run_bandit(bandit_env, m, sims, lambda a, k, r: reward(a, k), seed, noise=True, cfg=cfg)
         gumbel = np.random.default_rng(seed).gumbel(size=289)  # Searcher draws these right after the roots (stubs consume no rng)
@@ -856,30 +889,28 @@ def test_gumbel_result_and_clean_target_are_distinct():
 
 
 def test_particles_are_paired_and_cover_all_worlds():
+    """Every considered candidate is run in the same 4 worlds (particle, stratified reply uniform), in every block."""
     state = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[5, 5].set(2))
     mp = pytest.MonkeyPatch()
-    firsts = set()
     try:
         mp.setattr(az, "legal_mask", lambda *a: np.arange(289) < 16)
         mp.setattr(az, "determinize", lambda state, *a, **k: state)
         for seed in range(12):
             s = _Bandit(16, lambda a, k, r: 0.0)
             s.rng = np.random.default_rng(seed)
-            # one distinct particle id per root, assigned in creation order
             made = []
             s.make_node = lambda *a, made=made, **k: (made.append(len(made)), types.SimpleNamespace(
                 prior=np.where(np.arange(289) < 16, 1 / 16, 0.0), value=0.0, pid=made[-1]))[1]
             s.search(state, 0, 32, noise=False)
-            first_round = [c for c in s.calls if c[1] == 0]
-            assert len(first_round) == 16 and len({c[2] for c in first_round}) == 1  # paired within a round
-            assert len({c[3] for c in first_round}) == 1  # and share one reply draw
-            for visit in range(2):
-                assert len({c[2] for c in s.calls if c[1] == visit}) == 1
-            assert {c[2] for c in s.calls} == set(range(4))  # every world is used within the budget
-            firsts.add(first_round[0][2])
+            worlds = {}
+            for a, k, pid, u, v in s.calls:
+                worlds.setdefault(a, []).append((pid, u))
+            assert len(worlds) == 8 and all(len(w) == 4 for w in worlds.values())  # 8 candidates x 4 worlds
+            assert all(w == worlds[next(iter(worlds))] for w in worlds.values())  # identical (particle, reply) pairs: paired
+            assert sorted(pid for pid, _ in worlds[next(iter(worlds))]) == [0, 1, 2, 3]  # all particles used by each candidate
+            assert sorted(int(u * 4) for _, u in worlds[next(iter(worlds))]) == [0, 1, 2, 3]  # one reply uniform per stratum
     finally:
         mp.undo()
-    assert len(firsts) > 1  # the first comparison is not always particle 0
 
 
 def test_paired_root_reply_is_shared_and_valid():
@@ -960,3 +991,168 @@ def test_search_trades_generals_when_waiting_loses(monkeypatch):
     prior_value = np.mean(list(values.values()))
     assert s.target[good].sum() > 0.9 and s.best in good
     assert sum(s.target[a] * v for a, v in values.items()) > prior_value + 0.5
+
+
+# --- exact simultaneous-move toys: Monte Carlo root values vs exact expectation ------------------------------
+# Fully visible 5x5 positions (every enemy cell is adjacent to one of mine), a controlled net (uniform own prior, value
+# 0, scripted opponent distribution at the root) and a horizon that makes every child terminal, so the exact value of a
+# root action is E_reply[outcome] by enumerating the real engine's joint step. No hidden state: determinize is the identity.
+
+def _grid(*cells):
+    g = jnp.zeros((5, 5), dtype=jnp.int32)
+    for (r, c), v in cells:
+        g = g.at[r, c].set(v)
+    return game.create_initial_state(g)
+
+
+def _toy_defense():
+    """Enemy stack 7 beside my general 3 attacks with 6 (0.3) or waits (0.7): only reinforcing from (1,0) holds."""
+    s = _grid(((0, 0), 1), ((0, 1), 2))
+    return s._replace(armies=s.armies.at[0, 0].set(3).at[0, 1].set(7).at[1, 0].set(10),
+                      ownership=s.ownership.at[0, 1, 0].set(True),
+                      ownership_neutral=s.ownership_neutral.at[1, 0].set(False)), {1 * 8 + 2 * 2: 0.3, 200: 0.7}
+
+
+def _toy_trade():
+    """Adjacent generals 28 v 30. The enemy attacks (0.7) or waits (0.3): waiting then loses to an attack, attacking back trades."""
+    s = _grid(((0, 0), 1), ((0, 1), 2))
+    return s._replace(armies=s.armies.at[0, 0].set(28).at[0, 1].set(30)), {1 * 8 + 2 * 2: 0.7, 200: 0.3}
+
+
+def _toy_two_turn():
+    """Two-turn tactic: my 15 stack at (0,2) must first join (0,1) (which sees the enemy general at (0,0)), then capture.
+    The enemy general only waits or shuffles. Horizon 2: nothing is terminal after one ply for most moves."""
+    s = _grid(((4, 4), 1), ((0, 0), 2))
+    s = s._replace(armies=s.armies.at[0, 2].set(15).at[0, 1].set(1).at[4, 4].set(1),
+                   ownership=s.ownership.at[0, 0, 2].set(True).at[0, 0, 1].set(True),
+                   ownership_neutral=s.ownership_neutral.at[0, 2].set(False).at[0, 1].set(False))
+    return s, {200: 1.0}
+
+
+def _controlled_eval(opp):
+    """az.evaluate replacement: uniform own prior, value 0, the opponent plays `opp` ({action: p}) wherever those moves are legal."""
+    def fake(net, stacks, masks):
+        mine = masks[0] / masks[0].sum()
+        theirs = masks[1] / masks[1].sum()
+        if all(masks[1][a] for a in opp):
+            theirs = np.zeros(len(masks[1]))
+            for a, p in opp.items():
+                theirs[a] = p
+        return np.stack([mine, theirs]).astype(np.float32), np.zeros(2, np.float32)
+    return fake
+
+
+def _exact_q(state, opp, horizon=1, end=None):
+    """Exact value of every legal root action: E_reply[outcome], the game cut `horizon` steps after the root (draw = 0).
+    Beyond one step the continuation is the best own follow-up against the same scripted reply (a reference, not what
+    PUCT's interior computes)."""
+    end = int(state.time) + horizon if end is None else end
+    mask = az.legal_mask(game.get_observation(state, 0), 5, 5)
+    q = {}
+    for a in np.flatnonzero(mask):
+        tot = 0.0
+        for o, p in opp.items():
+            nxt, _ = game.step(state, jnp.asarray([az.decode(int(a), 5, 5), az.decode(o, 5, 5)], dtype=jnp.int32), general_trade=True)
+            term = az.outcome(nxt, 0, end, "draw")
+            tot += p * (term if term is not None else max(_exact_q(nxt, opp, end=end).values()))
+        q[int(a)] = tot
+    return q
+
+
+def _toy_runs(monkeypatch, toy, seeds, sims=32, horizon=1, cfg=az.SearchCfg(), diag=True):
+    state, opp = toy
+    monkeypatch.setattr(az, "evaluate", _controlled_eval(opp))
+    runs = []
+    for seed in range(seeds):
+        s = az.Searcher(types.SimpleNamespace(frames=2), 5, 5, int(state.time) + horizon, np.random.default_rng(seed), cfg)
+        s.search(state, 0, sims, diag=diag)
+        runs.append(s)
+    return runs
+
+
+def _stats(runs, ex):
+    mc = {}
+    for s in runs:
+        for a, c in s.summary["candidates"].items():
+            mc.setdefault(a, []).append(c["q"])
+    return {a: (np.mean(v), np.std(v, ddof=1) / np.sqrt(len(v)), len(v)) for a, v in mc.items()}
+
+
+@pytest.mark.parametrize("toy", [_toy_defense, _toy_trade])
+def test_toy_monte_carlo_q_is_calibrated_and_the_action_is_exactly_optimal(monkeypatch, toy):
+    """Exact E_reply[outcome] by enumeration vs search's Q over 120 fixed seeds: mean within 4 standard errors (across
+    seeds), zero spread where the outcome is reply-independent, and the played action is exact-optimal on >= 97% of seeds."""
+    t = toy()
+    ex = _exact_q(*t)
+    runs = _toy_runs(monkeypatch, t, 120)
+    best = [a for a, v in ex.items() if v == max(ex.values())]
+    assert len(set(round(v, 3) for v in ex.values())) == 2  # replies matter: two different consequences
+    # the 8-candidate cap (11 legal at 32 sims) may leave every good move out on rare seeds: declared limit, bounded rate
+    assert np.mean([s.best in best for s in runs]) >= 0.97
+    for a, (mean, se, n) in _stats(runs, ex).items():
+        assert n > 30 and abs(mean - ex[a]) <= 4 * se + 1e-9, (a, mean, ex[a], se)
+
+
+def test_diag_summary_accounts_for_every_sample(monkeypatch):
+    t = _toy_trade()
+    (s,) = _toy_runs(monkeypatch, t, 1)
+    d, plan = s.summary, s.plan
+    cand = d["candidates"]
+    assert sum(c["n"] for c in cand.values()) == plan["sims"] == int(s.root_n.sum())
+    assert sum(d["depth"].values()) == plan["sims"]
+    assert d["edges"][1]["new"] + d["edges"][1]["hit"] == plan["sims"]
+    for a, c in cand.items():
+        assert c["q"] == pytest.approx(s.root_w[a] / s.root_n[a]) and c["worlds"] <= plan["worlds"] and c["n"] >= plan["worlds"]
+        if c["n"] > 1:
+            assert c["se"] == pytest.approx(np.sqrt(c["var"] / c["n"]))
+    assert abs(s.target.sum() - 1) < 1e-5 and (s.target[s.root_n == 0] >= 0).all()
+    (s2,) = _toy_runs(monkeypatch, t, 1, diag=False)  # counters are off unless requested, and never change the decision
+    assert s2.summary is None and s2.best == s.best and np.array_equal(s2.root_n, s.root_n)
+
+
+def test_toy_two_turn_tactic_reports_depth_but_is_not_solved_at_32_sims(monkeypatch):
+    """Measured limit, not a pass: with a value-blind net the win needs the 2nd visit of a root edge AND the right follow-up.
+    Revisits do reach depth 2 (fixed worlds), but at 32 sims most candidates get one block, so the exact +1 is not found."""
+    t = _toy_two_turn()
+    ex = _exact_q(*t, horizon=2)
+    assert sorted(a for a, v in ex.items() if v == 1.0) == [20, 21] and sum(v == 0 for v in ex.values()) == 5
+    runs = _toy_runs(monkeypatch, t, 20, horizon=2)
+    depth = {}
+    for s in runs:
+        for k, c in s.summary["depth"].items():
+            depth[k] = depth.get(k, 0) + c
+    assert depth.get(2, 0) > 0 and depth[1] > depth[2]
+    assert all(c["q"] == 0.0 for s in runs for c in s.summary["candidates"].values())  # the +1 never reaches Q at this budget
+
+
+def test_two_turn_search_with_exact_leaf_value(monkeypatch):
+    """The 32-sim search finds a two-ply capture when the leaf value encodes its one-ply continuation.
+    A value-blind net does not solve it at this budget (test above); this isolates search from value learning."""
+    state, opp = _toy_two_turn()
+    start = int(state.time)
+    make_node = az.Searcher.make_node
+
+    def exact_leaf(self, state, me, *args, **kwargs):
+        node = make_node(self, state, me, *args, **kwargs)
+        if int(state.time) > start and int(state.winner) < 0:
+            node.value = max(_exact_q(state, opp, end=start + 2).values())
+        return node
+
+    monkeypatch.setattr(az.Searcher, "make_node", exact_leaf)
+    runs = _toy_runs(monkeypatch, (state, opp), 10, horizon=2)
+    assert all(s.best in {20, 21} for s in runs)
+    assert all(any(c["q"] > 0 for c in s.summary["candidates"].values()) for s in runs)
+
+
+def test_search_decision_depends_only_on_the_observation(monkeypatch):
+    """Two states with the same observation and public totals but a different hidden enemy general site search identically."""
+    def hidden(site):
+        s = game.create_initial_state(jnp.zeros((6, 6), dtype=jnp.int32).at[0, 0].set(1).at[site].set(2))
+        return s
+    net = az.Net(h=6, w=6, width=16, layers=2, heads=2, frames=2, attn="dense").eval()
+    out = []
+    for site in ((5, 5), (4, 5)):
+        s = az.Searcher(net, 6, 6, 50, np.random.default_rng(1))
+        n = s.search(hidden(site), 0, 8)
+        out.append((n, s.best, s.target))
+    assert np.array_equal(out[0][0], out[1][0]) and out[0][1] == out[1][1] and np.allclose(out[0][2], out[1][2])
