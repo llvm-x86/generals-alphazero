@@ -21,6 +21,10 @@ def test_paired_score_uses_complete_maps_and_draws():
     assert pairs == [0.5]  # at 2 turns no general capture; third game is an incomplete map pair
     assert ev.paired_interval([0.0, 0.5, 1.0]) == pytest.approx((1 / 6, 5 / 6), abs=0.2)
 
+def test_all_draw_maps_have_no_degenerate_bootstrap_claim(capsys):
+    ev.main(["random", "random", "--size", "5", "--games", "4", "--max-steps", "2"])
+    assert "no observed variation" in capsys.readouterr().out
+
 
 def test_run_counts_and_ckpt_paths(tmp_path):
     real, adj = ev.run("expander", "random", 6, 4, 30, 0)

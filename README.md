@@ -55,8 +55,8 @@ castle prior (`CASTLE_FRACTION`: 0.65 for 6x6, 0.63 for 8x8) was measured as tru
 
 Evaluate against built-in agents (random, expander, hunter, harvester) or a checkpoint
 (`ckpt:<path>`, policy argmax, or `--sims N` for search), on side-swapped map pairs.
-Real wins/losses/draws have Wilson intervals and match score has a paired-map bootstrap interval;
-material adjudication of draws is reported separately and is **not** a real win:
+Real wins/losses/draws have Wilson intervals; varying match scores get a paired-map bootstrap interval.
+Material adjudication of draws is reported separately and is **not** a real win:
 
 ```bash
 PYTHONPATH=. python examples/eval_agents.py expander random --size 8 --games 200 --max-steps 500

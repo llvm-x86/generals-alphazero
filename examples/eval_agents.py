@@ -181,7 +181,10 @@ def main(argv=None):
           f"max_steps {args.max_steps}, seeds {args.seed}..{args.seed + (args.games - 1) // 2}, sims {args.sims}")
     report("real outcomes (truncation = draw)", args.agent_a, args.agent_b, real, args.games)
     report("draws adjudicated by material proxy (sign of az_selfplay.score; NOT real wins)", args.agent_a, args.agent_b, adj, args.games)
-    if len(pairs) > 1:
+    if len(pairs) > 1 and min(pairs) == max(pairs):
+        print(f"paired map score: {pairs[0]:.3f} over {len(pairs)} maps; no observed variation, "
+              "so a bootstrap interval would be degenerate and is not evidence of equivalence")
+    elif len(pairs) > 1:
         lo, hi = paired_interval(pairs)
         print(f"paired map score (W=1,D=0.5,L=0): {np.mean(pairs):.3f}, bootstrap95 [{lo:.3f}, {hi:.3f}] "
               f"over {len(pairs)} complete two-seat maps"
